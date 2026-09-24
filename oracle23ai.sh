@@ -468,9 +468,8 @@ user_problem() (  # igual que password_problem, para nombres de usuario de Oracl
   if [[ ! $u =~ ^[A-Z][A-Z0-9_]{1,29}$ ]]; then
     echo "Usa de 2 a 30 caracteres: letras sin tildes, números y _, empezando por letra."; exit 0
   fi
-  case " SYS SYSTEM PDBADMIN SYSBACKUP SYSDG SYSKM SYSRAC AUDSYS DBSNMP XDB OUTLN PUBLIC ANONYMOUS CTXSYS MDSYS ORDSYS WMSYS LBACSYS DVSYS OJVMSYS GSMADMIN_INTERNAL DBSFWUSER USER USERS TABLE SELECT INSERT UPDATE DELETE FROM WHERE ORDER GROUP INDEX VIEW GRANT DATE NUMBER CHAR LEVEL SESSION ACCESS " in
-    *" $u "*) echo "«$u» es un nombre reservado de Oracle. Elige otro."; exit 0 ;;
-  esac
+  reserved="SYS SYSTEM PDBADMIN SYSBACKUP SYSDG SYSKM SYSRAC AUDSYS DBSNMP XDB OUTLN PUBLIC ANONYMOUS CTXSYS MDSYS ORDSYS WMSYS LBACSYS DVSYS OJVMSYS GSMADMIN_INTERNAL DBSFWUSER USER USERS TABLE SELECT INSERT UPDATE DELETE FROM WHERE ORDER GROUP INDEX VIEW GRANT DATE NUMBER CHAR LEVEL SESSION ACCESS"
+  if [[ " $reserved " == *" $u "* ]]; then echo "«$u» es un nombre reservado de Oracle. Elige otro."; exit 0; fi
   exit 1
 )
 
@@ -1112,13 +1111,15 @@ wizard_summary() {
   esac
   user_txt="${APP_USER:-no se crea}"
   extras_txt="${EXTRAS:-ninguna}"
-  local text="Esto es lo que se va a hacer:
+  local restart_txt="sí, con Docker" text
+  [[ $RESTART_POLICY == no ]] && restart_txt="no"
+  text="Esto es lo que se va a hacer:
 
   Docker ........... $engine_txt
   Imagen ........... $image_txt
   Contenedor ....... $cont_txt
   Puerto ........... $BIND_ADDR:$HOST_PORT
-  Arranque auto. ... $([[ $RESTART_POLICY == no ]] && echo no || echo 'sí, con Docker')"
+  Arranque auto. ... $restart_txt"
   text+="
   Usuario .......... $user_txt  (en $PDB_NAME)
   Herramientas ..... $extras_txt"
@@ -1196,7 +1197,8 @@ setup_docker_repo() {
   if (( ! DRY_RUN )); then
     if command -v gpg >/dev/null 2>&1; then
       local fpr
-      mkdir -m 700 -p "$TMP_DIR/gnupg"
+      mkdir -p "$TMP_DIR/gnupg"
+      chmod 700 "$TMP_DIR/gnupg"
       fpr=$(GNUPGHOME="$TMP_DIR/gnupg" gpg --batch --show-keys --with-colons "$key" 2>/dev/null \
         | awk -F: '/^fpr:/ {print $10; exit}') || fpr=""
       [[ $fpr == "$DOCKER_GPG_FPR" ]] || die "La clave descargada NO coincide con la huella oficial de Docker ($DOCKER_GPG_FPR). Se aborta por seguridad."
@@ -1562,8 +1564,8 @@ configure_db() {
   fi
 }
 
-write_wrapper() {  # write_wrapper destino programa [línea extra]
-  local dest="$1" target="$2" extra="${3:-}"
+write_wrapper() {  # write_wrapper destino programa [línea previa]
+  local dest="$1" target="$2" pre_line="${3:-}"
   if (( DRY_RUN )); then
     printf '%s crear %s -> %s\n' "${C_DIM}[simulación]${C_RESET}" "$dest" "$target"
     return 0
@@ -1571,7 +1573,7 @@ write_wrapper() {  # write_wrapper destino programa [línea extra]
   mkdir -p "$(dirname "$dest")"
   {
     printf '#!/bin/sh\n# Creado por oracle23ai.sh\n'
-    if [[ -n $extra ]]; then printf '%s\n' "$extra"; fi
+    if [[ -n $pre_line ]]; then printf '%s\n' "$pre_line"; fi
     printf 'exec "%s" "$@"\n' "$target"
   } >"$dest"
   chmod 0755 "$dest"
@@ -1967,7 +1969,8 @@ cmd_logs() {
 
 cmd_info() {
   require_config
-  printf '%s\n\n' "${C_BOLD}Oracle Database Free · contenedor $CONTAINER_NAME · imagen $IMAGE${C_RESET}"
+  printf '%s\n' "${C_BOLD}Oracle Database Free · contenedor $CONTAINER_NAME · imagen $IMAGE${C_RESET}"
+  printf '%s\n\n' "${C_DIM}Instalado: ${INSTALLED_AT:-?}${C_RESET}"
   connection_text
 }
 
