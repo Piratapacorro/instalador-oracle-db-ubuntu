@@ -1,0 +1,28 @@
+name: Comprobaciones
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  script:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sintaxis de bash
+        run: bash -n oracle23ai.sh
+
+      - name: ShellCheck
+        run: shellcheck --severity=warning oracle23ai.sh
+
+      - name: Ayuda y versión
+        run: |
+          ./oracle23ai.sh --version
+          ./oracle23ai.sh ayuda
+
+      - name: Diagnóstico (no cambia nada)
+        run: ./oracle23ai.sh comprobar

@@ -1,0 +1,10 @@
+# Pruebas locales y registros
+.pruebas/
+*.log
+
+# Editores y sistema
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

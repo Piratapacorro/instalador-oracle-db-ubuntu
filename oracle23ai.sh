@@ -1,0 +1,2264 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  oracle23ai.sh — Instalador y gestor de Oracle Database 23ai Free
+#  para Ubuntu 24.04 LTS con Docker Desktop (o Docker Engine si no hay KVM).
+#
+#  Uso:
+#     ./oracle23ai.sh                  Menú interactivo
+#     ./oracle23ai.sh instalar         Asistente de instalación
+#     ./oracle23ai.sh ayuda            Lista de comandos
+#
+#  Tras instalar queda disponible el comando «oracle23ai» (en ~/.local/bin).
+#  Licencia: MIT
+# =============================================================================
+set -Eeuo pipefail
+
+readonly APP_VERSION="1.0.0"
+readonly APP_CMD="oracle23ai"
+readonly APP_NAME="Instalador Oracle Database 23ai Free"
+
+# --- Rutas (estándar XDG) ------------------------------------------------------
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/oracle23ai"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/oracle23ai"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/oracle23ai"
+APPS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+BIN_DIR="$HOME/.local/bin"
+CONFIG_FILE="$CONFIG_DIR/config"
+INFO_FILE="$CONFIG_DIR/conexion.txt"
+
+# --- Base de datos -------------------------------------------------------------
+readonly PDB_NAME="FREEPDB1"
+readonly CDB_NAME="FREE"
+readonly PROFILE_NAME="PERFIL_PRACTICAS"
+
+# --- Descargas oficiales -------------------------------------------------------
+readonly DOCKER_REPO_URL="https://download.docker.com/linux/ubuntu"
+readonly DOCKER_GPG_URL="$DOCKER_REPO_URL/gpg"
+readonly DOCKER_GPG_FPR="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
+readonly DD_DEB_URL="https://desktop.docker.com/linux/main/amd64/docker-desktop-amd64.deb"
+readonly DD_SUMS_URL="https://desktop.docker.com/linux/main/amd64/checksums.txt"
+readonly SQLCL_URL="https://download.oracle.com/otn_software/java/sqldeveloper/sqlcl-latest.zip"
+readonly SQLDEV_URL="https://download.oracle.com/otn_software/java/sqldeveloper/sqldeveloper-24.3.1.347.1826-no-jre.zip"
+# Las capas de las imágenes oficiales se sirven desde Oracle Cloud Object Storage.
+# Algunas redes (por ejemplo, las de algunos centros educativos) lo bloquean.
+readonly OCI_STORAGE_HOST="objectstorage.us-phoenix-1.oraclecloud.com"
+
+# --- Requisitos ----------------------------------------------------------------
+readonly RAM_MIN_MB=3500 RAM_REC_MB=7000
+readonly DISK_MIN_GB=15 DISK_REC_GB=25
+readonly VM_MEM_MIN_MB=2800
+
+# --- Catálogo de imágenes: clave|imagen|descripción|descarga aproximada ---------
+readonly IMAGE_CATALOG=(
+  "oficial-23ai|container-registry.oracle.com/database/free:23.9.0.0|Oracle oficial · 23ai (23.9) · completa|3,4 GB"
+  "oficial-23ai-lite|container-registry.oracle.com/database/free:23.9.0.0-lite|Oracle oficial · 23ai (23.9) · lite, menos funciones|0,8 GB"
+  "oficial-26ai|container-registry.oracle.com/database/free:latest|Oracle oficial · 26ai (última 23.26.x) · completa|3,5 GB"
+  "hub-23ai|docker.io/gvenzl/oracle-free:23.9|Docker Hub (gvenzl) · 23ai (23.9)|1 GB"
+  "hub-23ai-full|docker.io/gvenzl/oracle-free:23.9-full|Docker Hub (gvenzl) · 23ai (23.9) · full|2 GB"
+  "hub-26ai|docker.io/gvenzl/oracle-free:23|Docker Hub (gvenzl) · 26ai (última 23.26.x)|1,1 GB"
+)
+
+# Paquetes no oficiales que chocan con los del repositorio de Docker
+readonly CONFLICTS_DESKTOP=(docker.io docker-cli podman-docker)
+readonly CONFLICTS_ENGINE=(docker.io docker-cli docker-compose docker-compose-v2 docker-doc docker-buildx podman-docker containerd runc)
+
+readonly PWD_RULES="Requisitos: 8 a 30 caracteres, empezar por letra y tener al menos una mayúscula, una minúscula y un número. Solo letras sin tildes, números, _ y #."
+
+# --- Estado de ejecución -------------------------------------------------------
+DRY_RUN=0
+USE_TUI=1
+STOP_ALL=0
+SUDO_READY=0
+SUDO_KEEPALIVE_PID=""
+APT_UPDATED=0
+TMP_DIR=""
+LOG_FILE=""
+NEEDS_RELOGIN=0
+DOCKER_GROUP_ADDED=0
+STEP_N=0
+STEP_TOTAL=0
+DOCKER=(docker)
+UI_W=76
+UI_H=20
+
+# --- Respuestas del asistente / configuración guardada (nunca contraseñas) ----
+ENGINE=""
+IMAGE_KEY=""
+IMAGE=""
+CONTAINER_NAME="oracle23ai"
+VOLUME_NAME=""
+HOST_PORT="1521"
+BIND_ADDR="127.0.0.1"
+APP_USER=""
+RESTART_POLICY="unless-stopped"
+DD_AUTOSTART="no"
+EXTRAS=""
+INSTALL_STAGE=""
+INSTALLED_AT=""
+EXISTING_ACTION=""
+EXISTING_IMAGE=""
+DATA_IS_BIND=0
+REMOVE_CONFLICTS=()
+ADMIN_PWD=""
+APP_PWD=""
+CONTAINER_SINCE=0
+
+readonly CONFIG_KEYS=(ENGINE IMAGE_KEY IMAGE CONTAINER_NAME VOLUME_NAME HOST_PORT BIND_ADDR APP_USER RESTART_POLICY DD_AUTOSTART EXTRAS INSTALL_STAGE INSTALLED_AT)
+
+# =============================================================================
+#  Salida por pantalla y registro
+# =============================================================================
+setup_output() {
+  if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+    C_RESET=$'\e[0m'; C_BOLD=$'\e[1m'; C_DIM=$'\e[2m'
+    C_RED=$'\e[31m'; C_GREEN=$'\e[32m'; C_YELLOW=$'\e[33m'; C_BLUE=$'\e[34m'; C_CYAN=$'\e[36m'
+  else
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""
+  fi
+  if [[ $(locale charmap 2>/dev/null) == "UTF-8" ]]; then
+    S_OK="✔"; S_ERR="✘"; S_WARN="⚠"; S_INFO="➜"; S_RULE="════════════════════════════════════════════════════════════"
+  else
+    S_OK="[OK]"; S_ERR="[X]"; S_WARN="[!]"; S_INFO="->"; S_RULE="============================================================"
+  fi
+}
+
+log() {
+  if [[ -n $LOG_FILE ]]; then printf '[%(%F %T)T] %s\n' -1 "$*" >>"$LOG_FILE"; fi
+  return 0
+}
+info() { printf '%s %s\n' "${C_BLUE}${S_INFO}${C_RESET}" "$*"; log "INFO  $*"; }
+ok()   { printf '%s %s\n' "${C_GREEN}${S_OK}${C_RESET}" "$*"; log "OK    $*"; }
+warn() { printf '%s %s\n' "${C_YELLOW}${S_WARN}${C_RESET}" "$*" >&2; log "AVISO $*"; }
+err()  { printf '%s %s\n' "${C_RED}${S_ERR}${C_RESET}" "$*" >&2; log "ERROR $*"; }
+
+die() {
+  err "$*"
+  if [[ -n $LOG_FILE ]]; then printf '  %s\n' "Registro completo: $LOG_FILE" >&2; fi
+  exit 1
+}
+
+step() {
+  STEP_N=$((STEP_N + 1))
+  printf '\n%s\n' "${C_BOLD}${C_CYAN}[$STEP_N/$STEP_TOTAL] $*${C_RESET}"
+  log "==== [$STEP_N/$STEP_TOTAL] $*"
+}
+
+init_log() {  # init_log nombre [anexar]
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  if [[ ${2:-} == anexar ]]; then
+    LOG_FILE="$STATE_DIR/$1.log"
+    [[ -e $LOG_FILE ]] || install -m 600 /dev/null "$LOG_FILE"
+  else
+    LOG_FILE="$STATE_DIR/$1-$(date +%Y%m%d-%H%M%S).log"
+    install -m 600 /dev/null "$LOG_FILE"
+  fi
+  log "---- $APP_CMD $APP_VERSION · $(uname -srm) · simulación=$DRY_RUN"
+}
+
+show_log_tail() {
+  [[ -n $LOG_FILE && -s $LOG_FILE ]] || return 0
+  printf '%s\n' "${C_DIM}   --- últimas líneas del registro ($LOG_FILE) ---" >&2
+  tail -n 15 "$LOG_FILE" | sed 's/^/   /' >&2
+  printf '%s\n' "   ---${C_RESET}" >&2
+}
+
+on_error() {
+  local rc=$? line="${1:-?}"
+  (( BASH_SUBSHELL == 0 )) || return 0
+  log "ERR código=$rc línea=$line orden=${BASH_COMMAND}"
+  err "Se ha producido un error inesperado (código $rc, línea $line)."
+  if [[ -n $LOG_FILE ]]; then err "Revisa el registro: $LOG_FILE"; fi
+  return 0
+}
+
+on_interrupt() {
+  printf '\n' >&2
+  err "Interrumpido por el usuario."
+  exit 130
+}
+
+cleanup() {
+  if [[ -n $SUDO_KEEPALIVE_PID ]]; then kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true; fi
+  if [[ -n $TMP_DIR && -d $TMP_DIR ]]; then rm -rf -- "$TMP_DIR"; fi
+  if [[ -t 1 ]]; then tput cnorm 2>/dev/null || true; fi
+  ADMIN_PWD=""; APP_PWD=""
+  return 0
+}
+
+make_tmp() {
+  if [[ -z $TMP_DIR ]]; then TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/oracle23ai.XXXXXX"); fi
+  return 0
+}
+
+fmt_time() { printf '%dm %02ds' $(($1 / 60)) $(($1 % 60)); }
+
+quote_cmd() {
+  local a out=""
+  for a in "$@"; do out+="$(printf '%q' "$a") "; done
+  printf '%s' "${out% }"
+}
+
+# Ejecuta una orden guardando su salida en el registro y mostrando un indicador.
+# En modo simulación solo muestra la orden.
+run() {  # run "descripción" orden [args...]
+  local desc="$1"; shift
+  if (( DRY_RUN )); then
+    printf '%s %s\n      %s\n' "${C_DIM}[simulación]${C_RESET}" "$desc" "${C_DIM}\$ $(quote_cmd "$@")${C_RESET}"
+    log "SIMULA $desc: $(quote_cmd "$@")"
+    return 0
+  fi
+  log "EJECUTA $desc: $(quote_cmd "$@")"
+  local rc=0 out="${LOG_FILE:-/dev/null}"
+  if [[ -t 1 ]]; then
+    "$@" >>"$out" 2>&1 </dev/null &
+    local pid=$! i=0 frames='|/-\'
+    tput civis 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null; do
+      printf '\r %s %s ' "${C_CYAN}${frames:i++%4:1}${C_RESET}" "$desc"
+      sleep 0.2
+    done
+    wait "$pid" || rc=$?
+    tput cnorm 2>/dev/null || true
+    printf '\r\e[K'
+  else
+    "$@" >>"$out" 2>&1 </dev/null || rc=$?
+  fi
+  if (( rc == 0 )); then
+    ok "$desc"
+  else
+    err "$desc: ha fallado (código $rc)"
+    show_log_tail
+  fi
+  return "$rc"
+}
+
+# Espera hasta que una comprobación sea cierta (o se agote el tiempo).
+wait_for() {  # wait_for "descripción" segundos orden [args...]
+  local desc="$1" timeout="$2"; shift 2
+  if (( DRY_RUN )); then printf '%s %s\n' "${C_DIM}[simulación]${C_RESET}" "$desc"; return 0; fi
+  local start=$SECONDS i=0 frames='|/-\'
+  while ! "$@"; do
+    if (( SECONDS - start >= timeout )); then
+      [[ -t 1 ]] && printf '\r\e[K'
+      return 1
+    fi
+    if [[ -t 1 ]]; then
+      printf '\r\e[K %s %s (%s)' "${C_CYAN}${frames:i++%4:1}${C_RESET}" "$desc" "$(fmt_time $((SECONDS - start)))"
+    fi
+    sleep 3
+  done
+  [[ -t 1 ]] && printf '\r\e[K'
+  ok "$desc"
+}
+
+# Descarga con barra de progreso (o simulada).
+download() {  # download URL destino
+  if (( DRY_RUN )); then
+    printf '%s descargar %s\n' "${C_DIM}[simulación]${C_RESET}" "$1"
+    return 0
+  fi
+  log "DESCARGA $1 -> $2"
+  if [[ -t 2 ]]; then
+    curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --progress-bar -o "$2" "$1"
+  else
+    curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 20 -o "$2" "$1"
+  fi
+}
+
+# =============================================================================
+#  Interfaz: ventanas con whiptail o preguntas en texto plano
+#  (todo lo que se dibuja va a stderr; los valores elegidos salen por stdout)
+# =============================================================================
+ui_init() {
+  if (( USE_TUI )) && command -v whiptail >/dev/null 2>&1 && [[ -t 0 && -t 2 ]]; then
+    local lines cols
+    lines=$(tput lines 2>/dev/null || echo 0)
+    cols=$(tput cols 2>/dev/null || echo 0)
+    if (( lines < 20 || cols < 70 )); then USE_TUI=0; fi
+  else
+    USE_TUI=0
+  fi
+  return 0
+}
+
+ui_backtitle() {
+  local t="$APP_NAME · v$APP_VERSION"
+  (( DRY_RUN )) && t+=" · MODO SIMULACIÓN (no se cambia nada)"
+  printf '%s' "$t"
+}
+
+# Calcula el tamaño de la ventana: UI_W (ancho), UI_H (alto), UI_TEXT (filas de texto)
+# y UI_MAXH (alto máximo que permite la terminal). Pensado para terminales de 80x24.
+ui_dims() {  # ui_dims "texto" filas_extra
+  local text="$1" extra="${2:-7}" cols lines line len wrap
+  cols=$(tput cols 2>/dev/null || echo 80)
+  lines=$(tput lines 2>/dev/null || echo 24)
+  UI_W=$((cols - 4))
+  if (( UI_W > 78 )); then UI_W=78; fi
+  wrap=$((UI_W - 6))
+  UI_TEXT=0
+  while IFS= read -r line; do
+    len=${#line}
+    UI_TEXT=$((UI_TEXT + (len == 0 ? 1 : (len + wrap - 1) / wrap)))
+  done <<<"$text"
+  UI_MAXH=$((lines - 1))
+  UI_H=$((UI_TEXT + extra))
+  if (( UI_H > UI_MAXH )); then UI_H=$UI_MAXH; fi
+  return 0
+}
+
+wt() { whiptail --backtitle "$(ui_backtitle)" "$@" 3>&1 1>&2 2>&3; }
+
+# Nota: no se usa --scrolltext porque con él Enter no pulsa «Aceptar» (el foco se
+# queda en el texto); por eso los textos son cortos y las ventanas se dimensionan.
+ui_msg() {  # ui_msg "título" "texto"
+  if (( USE_TUI )); then
+    ui_dims "$2" 7
+    whiptail --backtitle "$(ui_backtitle)" --title "$1" --ok-button "Aceptar" \
+      --msgbox "$2" "$UI_H" "$UI_W" >&2 || true
+  else
+    printf '\n%s\n%s\n' "${C_BOLD}── $1 ──${C_RESET}" "$2" >&2
+  fi
+  return 0
+}
+
+ui_info() {  # Aviso sin esperar respuesta
+  if (( USE_TUI )); then
+    ui_dims "$1" 5
+    whiptail --backtitle "$(ui_backtitle)" --title "Un momento" --infobox "$1" "$UI_H" "$UI_W" >&2 || true
+  else
+    printf '%s\n' "$1" >&2
+  fi
+  return 0
+}
+
+ui_yesno() {  # ui_yesno "título" "texto" [si|no] → 0 = sí
+  local def="${3:-si}"
+  if (( USE_TUI )); then
+    local extra=()
+    [[ $def == no ]] && extra=(--defaultno)
+    ui_dims "$2" 7
+    whiptail --backtitle "$(ui_backtitle)" --title "$1" --yes-button "Sí" --no-button "No" \
+      "${extra[@]}" --yesno "$2" "$UI_H" "$UI_W" >&2
+    return $?
+  fi
+  local hint ans
+  if [[ $def == no ]]; then hint="s/N"; else hint="S/n"; fi
+  printf '\n%s\n%s\n%s ' "${C_BOLD}$1${C_RESET}" "$2" "¿Sí o no? [$hint]:" >&2
+  IFS= read -r ans || ans=""
+  ans="${ans,,}"
+  ans="${ans:-${def:0:1}}"
+  [[ $ans == s* || $ans == y* ]]
+}
+
+ui_input() {  # ui_input "título" "texto" "valor por defecto" → valor
+  if (( USE_TUI )); then
+    ui_dims "$2" 8
+    wt --title "$1" --ok-button "Aceptar" --cancel-button "Cancelar" --inputbox "$2" "$UI_H" "$UI_W" "$3"
+    return
+  fi
+  local ans
+  printf '\n%s\n%s\n%s ' "${C_BOLD}$1${C_RESET}" "$2" "Respuesta${3:+ [$3]}:" >&2
+  IFS= read -r ans || return 1
+  printf '%s' "${ans:-$3}"
+}
+
+ui_password() {  # ui_password "título" "texto" → contraseña
+  if (( USE_TUI )); then
+    ui_dims "$2" 8
+    wt --title "$1" --ok-button "Aceptar" --cancel-button "Cancelar" --passwordbox "$2" "$UI_H" "$UI_W"
+    return
+  fi
+  local ans
+  printf '\n%s\n%s\n%s ' "${C_BOLD}$1${C_RESET}" "$2" "Contraseña (no se ve al escribir):" >&2
+  if [[ -t 0 ]]; then
+    IFS= read -r -s ans || return 1
+    printf '\n' >&2
+  else
+    IFS= read -r ans || return 1
+  fi
+  printf '%s' "$ans"
+}
+
+ui_menu() {  # ui_menu "título" "texto" "clave por defecto" clave1 desc1 [clave2 desc2 ...]
+  local title="$1" text="$2" def="$3"; shift 3
+  local n=$(($# / 2)) list
+  if (( USE_TUI )); then
+    ui_dims "$text" $((n + 7))
+    list=$((UI_H - UI_TEXT - 7))   # si no cabe todo, la lista se desplaza con las flechas
+    if (( list > n )); then list=$n; fi
+    if (( list < 3 )); then list=3; fi
+    wt --title "$title" --ok-button "Aceptar" --cancel-button "Cancelar" --notags \
+      --default-item "$def" --menu "$text" "$UI_H" "$UI_W" "$list" "$@"
+    return
+  fi
+  local keys=() i=0 defn=1 ans
+  printf '\n%s\n%s\n' "${C_BOLD}$title${C_RESET}" "$text" >&2
+  while (( $# )); do
+    keys+=("$1")
+    i=$((i + 1))
+    if [[ $1 == "$def" ]]; then defn=$i; fi
+    printf '  %d) %s\n' "$i" "$2" >&2
+    shift 2
+  done
+  while true; do
+    printf 'Elige una opción [%d]: ' "$defn" >&2
+    IFS= read -r ans || return 1
+    ans="${ans:-$defn}"
+    if [[ $ans =~ ^[0-9]+$ ]] && (( 10#$ans >= 1 && 10#$ans <= ${#keys[@]} )); then
+      printf '%s' "${keys[10#$ans - 1]}"
+      return 0
+    fi
+    printf 'Opción no válida.\n' >&2
+  done
+}
+
+ui_checklist() {  # ui_checklist "título" "texto" clave desc ON|OFF ... → claves separadas por espacios
+  local title="$1" text="$2"; shift 2
+  local n=$(($# / 3))
+  if (( USE_TUI )); then
+    local out list
+    ui_dims "$text" $((n + 7))
+    list=$((UI_H - UI_TEXT - 7))
+    if (( list > n )); then list=$n; fi
+    if (( list < 2 )); then list=2; fi
+    out=$(wt --title "$title" --ok-button "Aceptar" --cancel-button "Cancelar" --notags --separate-output \
+      --checklist "$text" "$UI_H" "$UI_W" "$list" "$@") || return 1
+    printf '%s' "$(printf '%s' "$out" | tr '\n' ' ' | sed 's/ *$//')"
+    return 0
+  fi
+  local sel=() def
+  printf '\n%s\n%s\n' "${C_BOLD}$title${C_RESET}" "$text" >&2
+  while (( $# )); do
+    def="no"
+    [[ $3 == ON ]] && def="si"
+    if ui_yesno "$2" "¿Incluir esta opción?" "$def"; then sel+=("$1"); fi
+    shift 3
+  done
+  printf '%s' "${sel[*]}"
+}
+
+cancelled() {
+  printf '\n' >&2
+  warn "Asistente cancelado. No se ha realizado ningún cambio."
+  exit 1
+}
+
+# =============================================================================
+#  Validaciones (en locale C para que [A-Z] signifique exactamente A-Z)
+# =============================================================================
+password_problem() (  # imprime el problema y devuelve 0 si la contraseña NO es válida
+  export LC_ALL=C
+  p="$1"
+  if (( ${#p} < 8 || ${#p} > 30 )); then echo "Debe tener entre 8 y 30 caracteres."; exit 0; fi
+  if [[ ! $p =~ ^[A-Za-z] ]]; then echo "Debe empezar por una letra."; exit 0; fi
+  if [[ ! $p =~ ^[A-Za-z0-9_#]+$ ]]; then echo "Solo se permiten letras sin tildes ni ñ, números, _ y #."; exit 0; fi
+  if [[ ! $p =~ [A-Z] ]]; then echo "Debe tener al menos una letra MAYÚSCULA."; exit 0; fi
+  if [[ ! $p =~ [a-z] ]]; then echo "Debe tener al menos una letra minúscula."; exit 0; fi
+  if [[ ! $p =~ [0-9] ]]; then echo "Debe tener al menos un número."; exit 0; fi
+  exit 1
+)
+
+valid_container_name() ( export LC_ALL=C; [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$ ]] )
+
+user_problem() (  # igual que password_problem, para nombres de usuario de Oracle
+  export LC_ALL=C
+  u="${1^^}"
+  if [[ ! $u =~ ^[A-Z][A-Z0-9_]{1,29}$ ]]; then
+    echo "Usa de 2 a 30 caracteres: letras sin tildes, números y _, empezando por letra."; exit 0
+  fi
+  case " SYS SYSTEM PDBADMIN SYSBACKUP SYSDG SYSKM SYSRAC AUDSYS DBSNMP XDB OUTLN PUBLIC ANONYMOUS CTXSYS MDSYS ORDSYS WMSYS LBACSYS DVSYS OJVMSYS GSMADMIN_INTERNAL DBSFWUSER USER USERS TABLE SELECT INSERT UPDATE DELETE FROM WHERE ORDER GROUP INDEX VIEW GRANT DATE NUMBER CHAR LEVEL SESSION ACCESS " in
+    *" $u "*) echo "«$u» es un nombre reservado de Oracle. Elige otro."; exit 0 ;;
+  esac
+  exit 1
+)
+
+# =============================================================================
+#  Detección del sistema
+# =============================================================================
+pkg_installed() { [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null) == ii* ]]; }
+pkg_version() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null || true; }
+in_group_db() { [[ " $(id -nG "$USER" 2>/dev/null) " == *" $1 "* ]]; }   # según /etc/group (no la sesión)
+
+read_os_release() {
+  OS_ID=$(. /etc/os-release 2>/dev/null && printf '%s' "${ID:-}") || OS_ID=""
+  OS_LIKE=$(. /etc/os-release 2>/dev/null && printf '%s' "${ID_LIKE:-}") || OS_LIKE=""
+  OS_VERSION=$(. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_ID:-}") || OS_VERSION=""
+  OS_NAME=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-Linux}") || OS_NAME="Linux"
+  OS_CODENAME=$(. /etc/os-release 2>/dev/null && printf '%s' "${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}") || OS_CODENAME=""
+  return 0
+}
+
+detect_system() {
+  read_os_release
+  ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+  MEM_MB=$(awk '/^MemTotal:/ {printf "%d", $2 / 1024}' /proc/meminfo)
+  DISK_ROOT_GB=$(df -Pk / | awk 'NR == 2 {printf "%d", $4 / 1048576}')
+  DISK_HOME_GB=$(df -Pk "$HOME" | awk 'NR == 2 {printf "%d", $4 / 1048576}')
+  CPU_VIRT=0
+  if grep -Eqw 'vmx|svm' /proc/cpuinfo; then CPU_VIRT=1; fi
+  HAS_SYSTEMD=0
+  if [[ -d /run/systemd/system ]]; then HAS_SYSTEMD=1; fi
+  VIRT_ENV=$(systemd-detect-virt 2>/dev/null) || VIRT_ENV="none"
+  HAS_DESKTOP=0
+  if [[ -n ${XDG_CURRENT_DESKTOP:-}${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; then HAS_DESKTOP=1; fi
+  DD_INSTALLED=0
+  if pkg_installed docker-desktop; then DD_INSTALLED=1; fi
+  ENGINE_INSTALLED=0
+  if pkg_installed docker-ce; then ENGINE_INSTALLED=1; fi
+  return 0
+}
+
+virt_hint() {
+  if [[ $VIRT_ENV != none && -n $VIRT_ENV ]]; then
+    printf ' (Ubuntu se ejecuta dentro de una máquina virtual «%s»: activa la virtualización anidada o usa Docker Engine)' "$VIRT_ENV"
+  else
+    printf ' (actívala en la BIOS/UEFI: Intel VT-x o AMD-V/SVM)'
+  fi
+}
+
+mb_to_gb() { awk -v m="$1" 'BEGIN {printf "%.1f", m / 1024}' | tr '.' ','; }
+
+preflight_collect() {
+  PF_OK=(); PF_WARN=(); PF_ERR=()
+  detect_system
+  if [[ $OS_ID == ubuntu && $OS_VERSION == 24.04 ]]; then
+    PF_OK+=("Sistema: $OS_NAME")
+  elif [[ $OS_ID == ubuntu || " $OS_LIKE " == *" ubuntu "* ]]; then
+    PF_WARN+=("Sistema: $OS_NAME. La herramienta está pensada para Ubuntu 24.04; puede funcionar, pero no está probada aquí.")
+  else
+    PF_ERR+=("Sistema no compatible: $OS_NAME. Se necesita Ubuntu (24.04 recomendado).")
+  fi
+  case $ARCH in
+    amd64) PF_OK+=("Arquitectura: amd64 (x86-64)") ;;
+    arm64) PF_WARN+=("Procesador ARM (arm64): Docker Desktop para Linux no existe para ARM; se usará Docker Engine.") ;;
+    *) PF_ERR+=("Arquitectura no compatible: $ARCH.") ;;
+  esac
+  if (( HAS_SYSTEMD )); then
+    PF_OK+=("systemd activo")
+  else
+    PF_ERR+=("systemd no está activo (¿WSL o un contenedor?). Hace falta un Ubuntu instalado normalmente.")
+  fi
+  if (( MEM_MB < RAM_MIN_MB )); then
+    PF_ERR+=("Memoria RAM: $(mb_to_gb "$MEM_MB") GB. Oracle y Docker necesitan al menos 4 GB (8 GB recomendados).")
+  elif (( MEM_MB < RAM_REC_MB )); then
+    PF_WARN+=("Memoria RAM: $(mb_to_gb "$MEM_MB") GB. Irá justo (se recomiendan 8 GB): cierra otros programas mientras uses Oracle.")
+  else
+    PF_OK+=("Memoria RAM: $(mb_to_gb "$MEM_MB") GB")
+  fi
+  local disk=$DISK_ROOT_GB
+  if (( DISK_HOME_GB < disk )); then disk=$DISK_HOME_GB; fi
+  if (( disk < DISK_MIN_GB )); then
+    PF_ERR+=("Espacio libre en disco: $disk GB. Se necesitan al menos $DISK_MIN_GB GB (recomendado $DISK_REC_GB GB).")
+  elif (( disk < DISK_REC_GB )); then
+    PF_WARN+=("Espacio libre en disco: $disk GB. Se recomiendan $DISK_REC_GB GB.")
+  else
+    PF_OK+=("Espacio libre en disco: $disk GB")
+  fi
+  if (( CPU_VIRT )); then
+    PF_OK+=("Virtualización de CPU disponible (KVM)")
+  else
+    PF_WARN+=("La CPU no ofrece virtualización$(virt_hint). Docker Desktop no funcionará; se usará Docker Engine.")
+  fi
+  if (( HAS_DESKTOP )); then
+    PF_OK+=("Escritorio gráfico: ${XDG_CURRENT_DESKTOP:-detectado}")
+  else
+    PF_WARN+=("No se detecta escritorio gráfico (¿conexión SSH?). Docker Desktop lo necesita; se usará Docker Engine.")
+  fi
+  if curl -sS -o /dev/null -m 10 -I https://download.docker.com/ 2>/dev/null; then
+    PF_OK+=("Conexión con download.docker.com")
+  else
+    PF_ERR+=("No hay conexión con download.docker.com. Revisa tu conexión a Internet (o el proxy).")
+  fi
+  return 0
+}
+
+# --- Red: ¿se pueden descargar las imágenes? -----------------------------------
+is_private_ipv4() {
+  local a b rest
+  IFS=. read -r a b rest <<<"$1"
+  [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ ]] || return 1
+  if (( a == 10 || a == 127 || a == 0 )); then return 0; fi
+  if (( a == 172 && b >= 16 && b <= 31 )); then return 0; fi
+  if (( a == 192 && b == 168 )); then return 0; fi
+  if (( a == 100 && b >= 64 && b <= 127 )); then return 0; fi
+  return 1
+}
+
+oracle_storage_ok() {
+  local ip
+  ip=$(getent ahostsv4 "$OCI_STORAGE_HOST" 2>/dev/null | awk 'NR == 1 {print $1}') || ip=""
+  [[ -n $ip ]] || return 1
+  if is_private_ipv4 "$ip"; then return 1; fi   # redirigido a un «sinkhole» de la red
+  curl -s -o /dev/null -m 8 "https://$OCI_STORAGE_HOST/" 2>/dev/null
+}
+
+dockerhub_ok() { curl -s -o /dev/null -m 8 https://registry-1.docker.io/v2/ 2>/dev/null; }
+
+# --- Catálogo de imágenes --------------------------------------------------------
+catalog_field() {  # catalog_field clave n  (2 = imagen, 3 = descripción, 4 = tamaño)
+  local entry
+  for entry in "${IMAGE_CATALOG[@]}"; do
+    if [[ ${entry%%|*} == "$1" ]]; then cut -d'|' -f"$2" <<<"$entry"; return 0; fi
+  done
+  return 1
+}
+catalog_key_for_image() {
+  local entry
+  for entry in "${IMAGE_CATALOG[@]}"; do
+    if [[ $(cut -d'|' -f2 <<<"$entry") == "$1" ]]; then printf '%s' "${entry%%|*}"; return 0; fi
+  done
+  return 1
+}
+is_gvenzl_image() { [[ $1 == *gvenzl/oracle-free* ]]; }
+is_oracle_registry_image() { [[ $1 == container-registry.oracle.com/* ]]; }
+hub_equivalent_key() { if [[ $1 == oficial-26ai ]]; then printf 'hub-26ai'; else printf 'hub-23ai'; fi; }
+
+# =============================================================================
+#  Docker: órdenes y consultas
+# =============================================================================
+set_docker_cmd() {  # set_docker_cmd [nosudo]
+  if [[ $ENGINE == desktop ]]; then
+    DOCKER=(docker --context desktop-linux)
+  elif docker --context default info >/dev/null 2>&1 || (( DRY_RUN )) || [[ ${1:-} == nosudo ]]; then
+    DOCKER=(docker --context default)
+  else
+    ensure_sudo
+    DOCKER=(sudo docker --context default)
+  fi
+  return 0
+}
+
+docker_ready() { command -v docker >/dev/null 2>&1 && "${DOCKER[@]}" info >/dev/null 2>&1; }
+docker_desktop_ready() { docker --context desktop-linux info >/dev/null 2>&1; }
+container_state() { "${DOCKER[@]}" inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || true; }
+volume_exists() { "${DOCKER[@]}" volume inspect "$VOLUME_NAME" >/dev/null 2>&1; }
+image_exists() { "${DOCKER[@]}" image inspect "$1" >/dev/null 2>&1; }
+
+print_container_logs() {
+  printf '%s\n' "${C_DIM}   --- últimas líneas de 'docker logs $CONTAINER_NAME' ---" >&2
+  "${DOCKER[@]}" logs --tail "${1:-30}" "$CONTAINER_NAME" 2>&1 | sed 's/^/   /' >&2 || true
+  printf '%s\n' "   ---${C_RESET}" >&2
+}
+
+port_in_use() { [[ -n $(ss -Hltn "sport = :$1" 2>/dev/null) ]]; }
+
+# --- SQL dentro del contenedor (las contraseñas viajan siempre por stdin) ------
+sql_sysdba() { "${DOCKER[@]}" exec -i "$CONTAINER_NAME" sqlplus -s -L / as sysdba; }
+
+db_sql_ready() {
+  local out
+  out=$(printf '%s\n' "SET HEADING OFF FEEDBACK OFF PAGESIZE 0" \
+    "SELECT open_mode FROM v\$pdbs WHERE name = '$PDB_NAME';" "EXIT" | sql_sysdba 2>/dev/null) || return 1
+  [[ $out == *"READ WRITE"* ]]
+}
+
+verify_login() {  # verify_login USUARIO CONTRASEÑA → 0 si puede conectar por el listener
+  local out
+  out=$(printf 'CONNECT %s/"%s"@//localhost:1521/%s\nSET HEADING OFF FEEDBACK OFF\nSELECT %s FROM dual;\nEXIT\n' \
+    "$1" "$2" "$PDB_NAME" "'CONEXION_OK'" \
+    | "${DOCKER[@]}" exec -i "$CONTAINER_NAME" sqlplus -s -L /nolog 2>&1) || true
+  [[ $out == *CONEXION_OK* ]]
+}
+
+admin_sql() {  # SQL para fijar la contraseña de SYS, SYSTEM y PDBADMIN
+  cat <<SQL
+WHENEVER SQLERROR EXIT FAILURE
+SET DEFINE OFF
+SET FEEDBACK OFF
+SET HEADING OFF
+BEGIN
+  EXECUTE IMMEDIATE 'ALTER USER SYS IDENTIFIED BY "$1"';
+  EXECUTE IMMEDIATE 'ALTER USER SYSTEM IDENTIFIED BY "$1" ACCOUNT UNLOCK';
+END;
+/
+ALTER SESSION SET CONTAINER = $PDB_NAME;
+DECLARE
+  n NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO n FROM dba_users WHERE username = 'PDBADMIN';
+  IF n > 0 THEN
+    EXECUTE IMMEDIATE 'ALTER USER PDBADMIN IDENTIFIED BY "$1" ACCOUNT UNLOCK';
+  END IF;
+END;
+/
+SQL
+}
+
+user_sql() {  # SQL (ya dentro de la PDB) para crear o actualizar un usuario de trabajo
+  cat <<SQL
+WHENEVER SQLERROR EXIT FAILURE
+SET DEFINE OFF
+SET FEEDBACK OFF
+DECLARE
+  n  NUMBER;
+  ts VARCHAR2(128);
+BEGIN
+  SELECT COUNT(*) INTO n FROM dba_profiles WHERE profile = '$PROFILE_NAME';
+  IF n = 0 THEN
+    EXECUTE IMMEDIATE 'CREATE PROFILE $PROFILE_NAME LIMIT PASSWORD_LIFE_TIME UNLIMITED';
+  END IF;
+  SELECT property_value INTO ts FROM database_properties
+   WHERE property_name = 'DEFAULT_PERMANENT_TABLESPACE';
+  SELECT COUNT(*) INTO n FROM dba_users WHERE username = '$1';
+  IF n = 0 THEN
+    EXECUTE IMMEDIATE 'CREATE USER $1 IDENTIFIED BY "$2" DEFAULT TABLESPACE ' || ts
+      || ' QUOTA UNLIMITED ON ' || ts || ' PROFILE $PROFILE_NAME';
+  ELSE
+    EXECUTE IMMEDIATE 'ALTER USER $1 IDENTIFIED BY "$2" ACCOUNT UNLOCK';
+  END IF;
+  EXECUTE IMMEDIATE 'GRANT CREATE SESSION TO $1';
+  EXECUTE IMMEDIATE 'GRANT DB_DEVELOPER_ROLE TO $1';
+END;
+/
+SQL
+}
+
+alter_user_sql() {  # cambiar contraseña y desbloquear un usuario existente de la PDB
+  cat <<SQL
+WHENEVER SQLERROR EXIT FAILURE
+SET DEFINE OFF
+SET FEEDBACK OFF
+ALTER SESSION SET CONTAINER = $PDB_NAME;
+DECLARE
+  n NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO n FROM dba_users WHERE username = '$1';
+  IF n = 0 THEN
+    RAISE_APPLICATION_ERROR(-20001, 'El usuario $1 no existe en $PDB_NAME');
+  END IF;
+  EXECUTE IMMEDIATE 'ALTER USER $1 IDENTIFIED BY "$2" ACCOUNT UNLOCK';
+END;
+/
+SQL
+}
+
+run_sql_script() {  # run_sql_script "descripción" < SQL por stdin
+  local desc="$1" out rc=0
+  if (( DRY_RUN )); then
+    cat >/dev/null
+    printf '%s %s %s\n' "${C_DIM}[simulación]${C_RESET}" "$desc" "${C_DIM}(SQL por stdin, no se muestra porque lleva contraseñas)${C_RESET}"
+    return 0
+  fi
+  out=$(sql_sysdba 2>&1) || rc=$?
+  log "sqlplus ($desc) código=$rc salida: $out"
+  if (( rc != 0 )) || [[ $out == *ORA-* || $out == *SP2-* || $out == *PLS-* ]]; then
+    err "$desc: ha fallado."
+    printf '%s\n' "$out" | sed 's/^/   /' >&2
+    return 1
+  fi
+  ok "$desc"
+}
+
+# =============================================================================
+#  sudo y apt
+# =============================================================================
+ensure_sudo() {
+  (( SUDO_READY )) && return 0
+  if (( DRY_RUN )); then SUDO_READY=1; return 0; fi
+  command -v sudo >/dev/null 2>&1 || die "No se encontró 'sudo'. Usa un usuario administrador."
+  if ! sudo -n true 2>/dev/null; then
+    printf '\n'
+    info "Se necesitan permisos de administrador: escribe la contraseña de TU usuario de Ubuntu."
+    info "(Mientras escribes no se ve nada; es normal.)"
+    sudo -v || die "No se pudieron obtener permisos de administrador (sudo). ¿Tu usuario es administrador?"
+  fi
+  SUDO_READY=1
+  ( while kill -0 "$$" 2>/dev/null; do sudo -n true 2>/dev/null || true; sleep 45; done ) &
+  SUDO_KEEPALIVE_PID=$!
+  return 0
+}
+
+apt_update_once() {
+  (( APT_UPDATED )) && return 0
+  ensure_sudo
+  if ! run "Actualizando la lista de paquetes (apt update)" sudo apt-get update -o DPkg::Lock::Timeout=300; then
+    warn "apt update ha dado errores (¿algún repositorio roto?). Se intenta continuar."
+  fi
+  APT_UPDATED=1
+  return 0
+}
+
+apt_install() {  # apt_install "descripción" paquete...
+  local desc="$1"; shift
+  local missing=() p
+  for p in "$@"; do
+    if ! pkg_installed "$p"; then missing+=("$p"); fi
+  done
+  if (( ${#missing[@]} == 0 )); then
+    ok "$desc: ya instalado"
+    return 0
+  fi
+  apt_update_once
+  run "$desc (${missing[*]})" sudo env DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y -o DPkg::Lock::Timeout=300 "${missing[@]}"
+}
+
+# =============================================================================
+#  Asistente (preguntas)
+# =============================================================================
+wizard() {
+  local text
+  text="Este asistente deja lista Oracle Database 23ai Free en tu Ubuntu:
+
+ 1. Instala Docker Desktop y lo que necesita (KVM, repositorio...).
+ 2. Descarga la imagen de Oracle Database Free.
+ 3. Crea el contenedor, con los datos en un volumen persistente.
+ 4. Pone tus contraseñas y crea tu usuario de trabajo.
+ 5. Instala el comando '$APP_CMD' para el día a día.
+
+Primero unas preguntas (Enter = opción recomendada) y luego todo
+va solo. Necesitarás tu contraseña de Ubuntu y unos 20-40 minutos."
+  if (( DRY_RUN )); then text+=$'\n\nMODO SIMULACIÓN: solo se muestra lo que se haría.'; fi
+  ui_msg "Bienvenida" "$text"
+  wizard_engine
+  wizard_conflicts
+  wizard_container
+  if [[ $EXISTING_ACTION != keep ]]; then
+    wizard_image
+    wizard_port
+    wizard_network
+  fi
+  wizard_admin_password
+  wizard_app_user
+  wizard_autostart
+  wizard_extras
+  wizard_summary || cancelled
+}
+
+wizard_engine() {
+  local reasons=() text
+  [[ $ARCH == amd64 ]] || reasons+=("Docker Desktop para Linux solo existe para procesadores x86-64 (amd64).")
+  (( CPU_VIRT )) || reasons+=("La CPU no ofrece virtualización KVM$(virt_hint).")
+  (( HAS_DESKTOP )) || reasons+=("No hay sesión de escritorio gráfico.")
+  (( HAS_SYSTEMD )) || reasons+=("systemd no está activo.")
+  if (( ${#reasons[@]} == 0 )); then
+    text="¿Con qué Docker quieres ejecutar Oracle?
+
+Docker Desktop es lo recomendado: trae interfaz gráfica y ejecuta los contenedores dentro de una pequeña máquina virtual (KVM)."
+    if (( DD_INSTALLED )); then text+=$'\n\n(Docker Desktop ya está instalado en este equipo.)'; fi
+    ENGINE=$(ui_menu "Motor de contenedores" "$text" "${ENGINE:-desktop}" \
+      desktop "Docker Desktop (recomendado)" \
+      engine "Docker Engine (sin interfaz gráfica, más ligero)") || cancelled
+  else
+    text="No se puede usar Docker Desktop en este equipo:
+$(printf ' - %s\n' "${reasons[@]}")
+
+Se usará Docker Engine (Docker sin interfaz gráfica). Oracle funciona exactamente igual."
+    ui_msg "Se usará Docker Engine" "$text"
+    ENGINE="engine"
+  fi
+  set_docker_cmd nosudo
+}
+
+wizard_conflicts() {
+  local list=() p
+  REMOVE_CONFLICTS=()
+  if [[ $ENGINE == desktop ]]; then
+    (( DD_INSTALLED )) && return 0
+    list=("${CONFLICTS_DESKTOP[@]}")
+  else
+    (( ENGINE_INSTALLED )) && return 0
+    list=("${CONFLICTS_ENGINE[@]}")
+  fi
+  for p in "${list[@]}"; do
+    if pkg_installed "$p"; then REMOVE_CONFLICTS+=("$p"); fi
+  done
+  (( ${#REMOVE_CONFLICTS[@]} )) || return 0
+  ui_yesno "Paquetes en conflicto" "Tienes instalados paquetes de Docker no oficiales que impiden instalar la versión oficial:
+
+   ${REMOVE_CONFLICTS[*]}
+
+Hay que desinstalarlos. Tus imágenes, contenedores y volúmenes de /var/lib/docker NO se borran.
+
+¿Desinstalarlos y continuar?" si || cancelled
+}
+
+wizard_container() {
+  local name state
+  while true; do
+    name=$(ui_input "Nombre del contenedor" "Nombre del contenedor de Oracle (letras, números, guion y guion bajo):" "$CONTAINER_NAME") || cancelled
+    if valid_container_name "$name"; then break; fi
+    ui_msg "Nombre no válido" "Usa solo letras sin tildes, números, guion (-), punto o guion bajo (_), empezando por letra o número."
+  done
+  CONTAINER_NAME="$name"
+  VOLUME_NAME="${CONTAINER_NAME}-datos"
+  EXISTING_ACTION=""
+  if docker_ready; then
+    state=$(container_state)
+    if [[ -n $state ]]; then ask_existing_container "$state"; fi
+  fi
+  return 0
+}
+
+# Lee del contenedor existente su puerto, IP, reinicio, datos e imagen.
+read_container_settings() {
+  local fmt out pb rp mtype msrc img ip port
+  fmt='{{with index .HostConfig.PortBindings "1521/tcp"}}{{with index . 0}}{{.HostIp}} {{.HostPort}}{{end}}{{end}}'
+  fmt+='|{{.HostConfig.RestartPolicy.Name}}'
+  fmt+='|{{range .Mounts}}{{if eq .Destination "/opt/oracle/oradata"}}{{.Type}} {{if eq .Type "volume"}}{{.Name}}{{else}}{{.Source}}{{end}}{{end}}{{end}}'
+  fmt+='|{{.Config.Image}}'
+  out=$("${DOCKER[@]}" inspect -f "$fmt" "$CONTAINER_NAME" 2>/dev/null) || return 0
+  IFS='|' read -r pb rp mtype img <<<"$out"
+  if [[ -n $pb ]]; then
+    read -r ip port <<<"$pb"
+    [[ -z $port ]] && { port="$ip"; ip=""; }
+    [[ $port =~ ^[0-9]+$ ]] && HOST_PORT="$port"
+    if [[ $ip == 127.0.0.1 || $ip == localhost ]]; then BIND_ADDR="127.0.0.1"; else BIND_ADDR="0.0.0.0"; fi
+  fi
+  [[ -n $rp ]] && RESTART_POLICY="$rp"
+  DATA_IS_BIND=0
+  if [[ -n $mtype ]]; then
+    msrc="${mtype#* }"
+    if [[ ${mtype%% *} == bind ]]; then DATA_IS_BIND=1; fi
+    [[ -n $msrc ]] && VOLUME_NAME="$msrc"
+  fi
+  [[ -n $img ]] && EXISTING_IMAGE="$img"
+  return 0
+}
+
+ask_existing_container() {
+  local state="$1" cur_img
+  EXISTING_IMAGE="?"
+  read_container_settings
+  cur_img="$EXISTING_IMAGE"
+  while true; do
+    EXISTING_ACTION=$(ui_menu "El contenedor ya existe" "Ya existe un contenedor llamado '$CONTAINER_NAME' (estado: $state).
+Imagen: $cur_img
+
+¿Qué quieres hacer?" keep \
+      keep "Conservarlo: arrancarlo y aplicar contraseñas y usuario" \
+      recreate "Recrearlo conservando los datos (para cambiar puerto u opciones)" \
+      wipe "Borrarlo TODO (contenedor y datos) y empezar de cero") || cancelled
+    if [[ $EXISTING_ACTION != wipe ]]; then break; fi
+    if ui_yesno "Confirmar borrado" "Se borrarán el contenedor '$CONTAINER_NAME' y el volumen '$VOLUME_NAME' con TODAS tus tablas y datos. No se puede deshacer.
+
+¿Seguro que quieres borrarlo todo?" no; then break; fi
+  done
+  if [[ $EXISTING_ACTION == keep ]]; then
+    IMAGE="$cur_img"
+    IMAGE_KEY=$(catalog_key_for_image "$cur_img") || IMAGE_KEY=""
+  fi
+  return 0
+}
+
+wizard_image() {
+  local blocked=0 def text args=() entry key desc size
+  ui_info "Comprobando la red (acceso a los registros de imágenes)..."
+  if ! oracle_storage_ok; then blocked=1; fi
+  if (( blocked )); then def="hub-23ai"; else def="oficial-23ai"; fi
+  if [[ -n $IMAGE_KEY ]] && catalog_field "$IMAGE_KEY" 2 >/dev/null; then
+    if ! (( blocked )) || [[ $IMAGE_KEY == hub-* ]]; then def="$IMAGE_KEY"; fi
+  fi
+  text="Elige la imagen. 23.9 es la última «23ai» (la de las prácticas);
+23.26.x se llama «26ai» y es su continuación (23ai y más)."
+  if (( blocked )); then
+    text+="
+
+AVISO: tu red bloquea Oracle Cloud Storage, de donde se bajan las
+imágenes oficiales (pasa en redes de algunos centros educativos).
+Usa Docker Hub: es la misma base de datos, empaquetada por Gerald
+Venzl (product manager de Oracle)."
+  fi
+  for entry in "${IMAGE_CATALOG[@]}"; do
+    key=$(cut -d'|' -f1 <<<"$entry")
+    desc=$(cut -d'|' -f3 <<<"$entry")
+    size=$(cut -d'|' -f4 <<<"$entry")
+    desc+=" · ~$size"
+    [[ $key == "$def" ]] && desc+="  [recomendada]"
+    args+=("$key" "$desc")
+  done
+  IMAGE_KEY=$(ui_menu "Imagen de Oracle" "$text" "$def" "${args[@]}") || cancelled
+  IMAGE=$(catalog_field "$IMAGE_KEY" 2)
+}
+
+wizard_port() {
+  local port
+  while true; do
+    port=$(ui_input "Puerto" "Puerto de tu equipo en el que escuchará Oracle.
+El estándar es 1521; cámbialo solo si ya lo usa otro programa." "$HOST_PORT") || cancelled
+    if [[ ! $port =~ ^[1-9][0-9]{3,4}$ ]] || (( port < 1024 || port > 65535 )); then
+      ui_msg "Puerto no válido" "Escribe un número entre 1024 y 65535."
+      continue
+    fi
+    if [[ $EXISTING_ACTION != recreate && $EXISTING_ACTION != wipe ]] && port_in_use "$port"; then
+      if ! ui_yesno "Puerto ocupado" "El puerto $port ya lo usa otro programa de este equipo.
+
+¿Quieres usarlo igualmente? (Elige «No» para escribir otro)" no; then
+        continue
+      fi
+    fi
+    break
+  done
+  HOST_PORT="$port"
+}
+
+wizard_network() {
+  local def="no"
+  [[ $BIND_ADDR == 0.0.0.0 ]] && def="si"
+  if ui_yesno "Acceso desde otros equipos" "¿Quieres que OTROS equipos de tu red puedan conectarse a esta base de datos?
+
+- No (recomendado): solo se podrá conectar desde este mismo equipo.
+- Sí: cualquiera de tu red podrá intentar conectarse al puerto $HOST_PORT." "$def"; then
+    BIND_ADDR="0.0.0.0"
+  else
+    BIND_ADDR="127.0.0.1"
+  fi
+}
+
+ask_new_password() {  # ask_new_password "descripción" → contraseña por stdout
+  local p1 p2 problem
+  while true; do
+    p1=$(ui_password "Contraseña" "Contraseña para $1.
+
+$PWD_RULES") || return 1
+    if problem=$(password_problem "$p1"); then
+      ui_msg "Contraseña no válida" "$problem"
+      continue
+    fi
+    p2=$(ui_password "Confirmar contraseña" "Vuelve a escribir la contraseña para $1:") || return 1
+    if [[ $p1 != "$p2" ]]; then
+      ui_msg "No coinciden" "Las dos contraseñas no coinciden. Inténtalo otra vez."
+      continue
+    fi
+    printf '%s' "$p1"
+    return 0
+  done
+}
+
+wizard_admin_password() {
+  ADMIN_PWD=$(ask_new_password "los administradores SYS, SYSTEM y PDBADMIN") || cancelled
+}
+
+wizard_app_user() {
+  local name problem
+  if ! ui_yesno "Usuario de trabajo" "¿Crear un usuario propio para tus prácticas en $PDB_NAME?
+
+Es lo recomendado: no conviene trabajar con SYS ni SYSTEM. Tendrá el rol DB_DEVELOPER_ROLE (crear tablas, vistas, procedimientos, etc.)." si; then
+    APP_USER=""
+    APP_PWD=""
+    return 0
+  fi
+  while true; do
+    name=$(ui_input "Usuario de trabajo" "Nombre del usuario (letras sin tildes, números y _, empezando por letra):" "${APP_USER:-alumno}") || cancelled
+    if problem=$(user_problem "$name"); then
+      ui_msg "Nombre no válido" "$problem"
+      continue
+    fi
+    break
+  done
+  APP_USER="${name^^}"
+  if ui_yesno "Contraseña de $APP_USER" "¿Usar para $APP_USER la misma contraseña que para los administradores?
+
+(Más cómodo; menos seguro. Si dices «No», te pediré otra.)" no; then
+    APP_PWD="$ADMIN_PWD"
+  else
+    APP_PWD=$(ask_new_password "el usuario $APP_USER") || cancelled
+  fi
+}
+
+wizard_autostart() {
+  if [[ $EXISTING_ACTION != keep ]]; then
+    local rdef="si"
+    [[ $RESTART_POLICY == no ]] && rdef="no"
+    if ui_yesno "Arranque automático de Oracle" "¿Quieres que Oracle arranque solo cada vez que se inicie Docker?
+
+(Si dices «No», tendrás que usar '$APP_CMD iniciar' cada vez.)" "$rdef"; then
+      RESTART_POLICY="unless-stopped"
+    else
+      RESTART_POLICY="no"
+    fi
+  fi
+  if [[ $ENGINE == desktop ]]; then
+    local def="no"
+    [[ $DD_AUTOSTART == yes ]] && def="si"
+    if ui_yesno "Docker Desktop al iniciar sesión" "¿Quieres que Docker Desktop se abra solo al iniciar sesión en Ubuntu?
+
+Docker Desktop reserva varios GB de RAM mientras está abierto. Si dices «No», '$APP_CMD iniciar' lo abrirá cuando lo necesites." "$def"; then
+      DD_AUTOSTART="yes"
+    else
+      DD_AUTOSTART="no"
+    fi
+  fi
+}
+
+wizard_extras() {
+  local s1="OFF" s2="OFF"
+  [[ " $EXTRAS " == *" sqlcl "* ]] && s1="ON"
+  [[ " $EXTRAS " == *" sqldeveloper "* ]] && s2="ON"
+  EXTRAS=$(ui_checklist "Herramientas opcionales" "La base de datos ya trae SQL*Plus dentro del contenedor ('$APP_CMD sql').
+Si quieres, también puedo instalar en tu Ubuntu (espacio para marcar):" \
+    sqlcl "SQLcl: línea de comandos moderna de Oracle (~120 MB + Java 17)" "$s1" \
+    sqldeveloper "SQL Developer 24.3.1: entorno gráfico (~560 MB + JDK 17)" "$s2") || cancelled
+}
+
+wizard_summary() {
+  local engine_txt image_txt extras_txt user_txt cont_txt dl=""
+  if [[ $ENGINE == desktop ]]; then
+    if (( DD_INSTALLED )); then engine_txt="Docker Desktop (ya instalado)"; else engine_txt="Docker Desktop (se instalará)"; dl="Docker Desktop ~450 MB"; fi
+  else
+    if (( ENGINE_INSTALLED )); then engine_txt="Docker Engine (ya instalado)"; else engine_txt="Docker Engine (se instalará)"; fi
+  fi
+  image_txt="$IMAGE"
+  if [[ $EXISTING_ACTION != keep && -n $IMAGE_KEY ]]; then
+    dl+="${dl:+, }imagen ~$(catalog_field "$IMAGE_KEY" 4)"
+  fi
+  case $EXISTING_ACTION in
+    keep) cont_txt="$CONTAINER_NAME (se conserva tal cual)" ;;
+    recreate) cont_txt="$CONTAINER_NAME (se recrea; los datos se conservan)" ;;
+    wipe) cont_txt="$CONTAINER_NAME (se BORRA y se crea de cero)" ;;
+    *) cont_txt="$CONTAINER_NAME (datos en el volumen $VOLUME_NAME)" ;;
+  esac
+  user_txt="${APP_USER:-no se crea}"
+  extras_txt="${EXTRAS:-ninguna}"
+  local text="Esto es lo que se va a hacer:
+
+  Docker ........... $engine_txt
+  Imagen ........... $image_txt
+  Contenedor ....... $cont_txt
+  Puerto ........... $BIND_ADDR:$HOST_PORT
+  Arranque auto. ... $([[ $RESTART_POLICY == no ]] && echo no || echo 'sí, con Docker')"
+  text+="
+  Usuario .......... $user_txt  (en $PDB_NAME)
+  Herramientas ..... $extras_txt"
+  if (( ${#REMOVE_CONFLICTS[@]} )); then text+="
+  Se desinstala .... ${REMOVE_CONFLICTS[*]}"; fi
+  if [[ -n $dl ]]; then text+="
+
+Descargas aproximadas: $dl."; fi
+  text+="
+
+¿Empezamos?"
+  ui_yesno "Resumen" "$text" si
+}
+
+# =============================================================================
+#  Pasos de instalación
+# =============================================================================
+install_base_packages() {
+  local pkgs=(ca-certificates curl gnupg)
+  if [[ $ENGINE == desktop ]]; then
+    pkgs+=(cpu-checker)
+    [[ ${XDG_CURRENT_DESKTOP:-} == *GNOME* ]] || pkgs+=(gnome-terminal)
+  fi
+  if [[ -n $EXTRAS ]]; then pkgs+=(unzip); fi
+  apt_install "Paquetes básicos" "${pkgs[@]}" || die "No se pudieron instalar los paquetes básicos."
+}
+
+setup_kvm() {
+  if ! grep -Eqw 'vmx|svm' /proc/cpuinfo; then
+    die "La CPU no ofrece virtualización$(virt_hint). Vuelve a ejecutar el asistente y elige Docker Engine."
+  fi
+  if [[ ! -e /dev/kvm ]]; then
+    ensure_sudo
+    local mod="kvm_intel"
+    grep -qw svm /proc/cpuinfo && mod="kvm_amd"
+    run "Cargando los módulos de KVM" sudo modprobe -a kvm "$mod" || true
+    if [[ ! -e /dev/kvm ]] && (( ! DRY_RUN )); then
+      die "No existe /dev/kvm. Activa la virtualización (Intel VT-x o AMD-V/SVM) en la BIOS/UEFI y vuelve a intentarlo."
+    fi
+  fi
+  if command -v kvm-ok >/dev/null 2>&1; then
+    log "kvm-ok: $(kvm-ok 2>&1 || true)"
+  fi
+  ok "Virtualización KVM disponible"
+  if ! in_group_db kvm; then
+    ensure_sudo
+    run "Añadiendo tu usuario al grupo kvm" sudo usermod -aG kvm "$USER" || die "No se pudo añadir tu usuario al grupo kvm."
+  fi
+  if [[ -r /dev/kvm && -w /dev/kvm ]] || (( DRY_RUN )); then
+    ok "Tu usuario tiene acceso a /dev/kvm"
+  else
+    NEEDS_RELOGIN=1
+    warn "Tu sesión actual aún no tiene acceso a /dev/kvm: hará falta cerrar sesión y volver a entrar."
+  fi
+}
+
+remove_conflicts() {
+  (( ${#REMOVE_CONFLICTS[@]} )) || return 0
+  ensure_sudo
+  run "Desinstalando paquetes de Docker no oficiales (${REMOVE_CONFLICTS[*]})" \
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get remove -y -o DPkg::Lock::Timeout=300 "${REMOVE_CONFLICTS[@]}" \
+    || die "No se pudieron desinstalar los paquetes en conflicto."
+}
+
+setup_docker_repo() {
+  if grep -rqsE '^[^#]*download\.docker\.com' /etc/apt/sources.list /etc/apt/sources.list.d/; then
+    ok "Repositorio oficial de Docker ya configurado"
+    return 0
+  fi
+  ensure_sudo
+  make_tmp
+  local key="$TMP_DIR/docker.asc" src="$TMP_DIR/docker.sources"
+  run "Descargando la clave GPG de Docker" curl -fsSL --retry 3 -o "$key" "$DOCKER_GPG_URL" \
+    || die "No se pudo descargar la clave de Docker."
+  if (( ! DRY_RUN )); then
+    if command -v gpg >/dev/null 2>&1; then
+      local fpr
+      mkdir -m 700 -p "$TMP_DIR/gnupg"
+      fpr=$(GNUPGHOME="$TMP_DIR/gnupg" gpg --batch --show-keys --with-colons "$key" 2>/dev/null \
+        | awk -F: '/^fpr:/ {print $10; exit}') || fpr=""
+      [[ $fpr == "$DOCKER_GPG_FPR" ]] || die "La clave descargada NO coincide con la huella oficial de Docker ($DOCKER_GPG_FPR). Se aborta por seguridad."
+      ok "Huella de la clave de Docker verificada"
+    else
+      warn "gpg no está disponible: no se verifica la huella de la clave de Docker."
+    fi
+  fi
+  printf 'Types: deb\nURIs: %s\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
+    "$DOCKER_REPO_URL" "$OS_CODENAME" "$ARCH" >"$src"
+  run "Instalando la clave en /etc/apt/keyrings/docker.asc" sudo install -D -m 0644 "$key" /etc/apt/keyrings/docker.asc \
+    || die "No se pudo instalar la clave de Docker."
+  run "Añadiendo el repositorio oficial de Docker" sudo install -m 0644 "$src" /etc/apt/sources.list.d/docker.sources \
+    || die "No se pudo añadir el repositorio de Docker."
+  APT_UPDATED=0
+  apt_update_once
+}
+
+install_docker_desktop() {
+  if pkg_installed docker-desktop; then
+    ok "Docker Desktop ya está instalado (versión $(pkg_version docker-desktop))"
+    return 0
+  fi
+  remove_conflicts
+  setup_docker_repo
+  make_tmp
+  local dir="$TMP_DIR/docker-desktop" deb sums attempt expected actual
+  deb="$dir/docker-desktop-amd64.deb"
+  sums="$dir/checksums.txt"
+  mkdir -p "$dir"
+  chmod 755 "$TMP_DIR" "$dir"   # el usuario _apt debe poder leer el .deb
+  for attempt in 1 2; do
+    info "Descargando Docker Desktop (~450 MB)..."
+    download "$DD_DEB_URL" "$deb" || die "No se pudo descargar Docker Desktop."
+    (( DRY_RUN )) && break
+    if ! curl -fsSL --retry 3 -o "$sums" "$DD_SUMS_URL"; then
+      warn "No se pudo descargar checksums.txt: se comprueba solo que el paquete sea válido."
+      dpkg-deb --info "$deb" >/dev/null 2>&1 || die "El paquete descargado está dañado."
+      break
+    fi
+    expected=$(awk '$2 ~ /docker-desktop-amd64\.deb$/ {print $1}' "$sums")
+    actual=$(sha256sum "$deb" | awk '{print $1}')
+    if [[ -n $expected && $expected == "$actual" ]]; then
+      ok "Suma SHA-256 del paquete verificada"
+      break
+    fi
+    (( attempt == 2 )) && die "La suma SHA-256 de Docker Desktop no coincide. Vuelve a intentarlo más tarde."
+    warn "La suma SHA-256 no coincide (¿se publicó una versión nueva durante la descarga?). Se repite la descarga."
+  done
+  chmod 644 "$deb" 2>/dev/null || true
+  ensure_sudo
+  apt_update_once
+  run "Instalando Docker Desktop (puede tardar varios minutos)" sudo env DEBIAN_FRONTEND=noninteractive \
+    apt-get install -y -o DPkg::Lock::Timeout=300 "$deb" || die "No se pudo instalar Docker Desktop."
+}
+
+install_docker_engine() {
+  if pkg_installed docker-ce; then
+    ok "Docker Engine ya está instalado (versión $(pkg_version docker-ce))"
+  else
+    remove_conflicts
+    setup_docker_repo
+    apt_install "Instalando Docker Engine" docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+      || die "No se pudo instalar Docker Engine."
+  fi
+}
+
+start_docker() {
+  if [[ $ENGINE == desktop ]]; then start_docker_desktop; else start_docker_engine; fi
+}
+
+relogin_exit() {
+  INSTALL_STAGE="relogin"
+  save_config
+  printf '\n%s\n' "${C_YELLOW}${C_BOLD}$S_RULE${C_RESET}"
+  printf '%s\n' "${C_YELLOW}${C_BOLD}  Hace falta CERRAR SESIÓN para continuar${C_RESET}"
+  printf '%s\n\n' "${C_YELLOW}${C_BOLD}$S_RULE${C_RESET}"
+  printf '%s\n' "Tu usuario se ha añadido al grupo «kvm», pero la sesión actual todavía no lo sabe."
+  printf '%s\n\n' "Docker Desktop no podrá arrancar hasta que cierres sesión y vuelvas a entrar (o reinicies)."
+  printf '%s\n' "Después, vuelve a ejecutar:"
+  printf '\n    %s\n\n' "${C_BOLD}$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo ./oracle23ai.sh) instalar${C_RESET}"
+  printf '%s\n' "Se recordarán tus respuestas (salvo las contraseñas) y se continuará donde lo dejaste."
+  exit 0
+}
+
+start_docker_desktop() {
+  (( NEEDS_RELOGIN )) && relogin_exit
+  if [[ $DD_AUTOSTART == yes ]]; then
+    run "Activando el inicio automático de Docker Desktop" systemctl --user enable docker-desktop || true
+  fi
+  set_docker_cmd
+  if docker_desktop_ready; then
+    ok "Docker Desktop ya está en marcha"
+  else
+    run "Abriendo Docker Desktop" systemctl --user start docker-desktop || die "No se pudo arrancar Docker Desktop."
+    printf '\n%s\n' "${C_YELLOW}${C_BOLD}  ACCIÓN NECESARIA en la ventana de Docker Desktop:${C_RESET}"
+    printf '%s\n' "  1. La primera vez aparece el «Docker Subscription Service Agreement»: léelo y pulsa «Accept»."
+    printf '%s\n' "     (Es gratuito para uso personal y educativo.)"
+    printf '%s\n' "  2. Puedes saltarte el inicio de sesión y la encuesta («Skip» / «Continue without signing in»)."
+    printf '%s\n\n' "  La instalación seguirá sola en cuanto Docker Desktop esté listo."
+    if command -v notify-send >/dev/null 2>&1 && (( ! DRY_RUN )); then
+      notify-send "Instalador Oracle 23ai" "Acepta el acuerdo de Docker Desktop para continuar" 2>/dev/null || true
+    fi
+    wait_for "Esperando a que Docker Desktop esté listo" 1200 docker_desktop_ready \
+      || die "Docker Desktop no ha arrancado en 20 minutos. Ábrelo desde el menú de aplicaciones, revisa si muestra algún error y vuelve a ejecutar '$APP_CMD instalar'. Registros de Docker Desktop: ~/.docker/desktop/log/"
+  fi
+  if (( ! DRY_RUN )); then
+    docker context use desktop-linux >>"$LOG_FILE" 2>&1 || true
+  fi
+  check_desktop_memory
+}
+
+check_desktop_memory() {
+  (( DRY_RUN )) && return 0
+  local bytes mb choice
+  while true; do
+    bytes=$("${DOCKER[@]}" info --format '{{.MemTotal}}' 2>/dev/null) || bytes=0
+    [[ $bytes =~ ^[0-9]+$ ]] || bytes=0
+    mb=$((bytes / 1048576))
+    if (( mb >= VM_MEM_MIN_MB )); then
+      ok "Memoria disponible para Docker: $(mb_to_gb "$mb") GB"
+      return 0
+    fi
+    choice=$(ui_menu "Poca memoria para Docker" "Docker Desktop solo tiene $(mb_to_gb "$mb") GB de RAM y Oracle necesita al menos 3 GB (mejor 4 GB).
+
+Cómo aumentarla:
+ 1. En Docker Desktop abre Settings (icono del engranaje).
+ 2. Resources > Advanced > Memory limit: ponlo en 4 GB o más.
+ 3. Pulsa «Apply & restart» y espera a que termine." check \
+      check "Ya lo he cambiado: comprobar otra vez" \
+      continue "Continuar de todas formas (puede fallar)" \
+      cancel "Cancelar la instalación") || choice="cancel"
+    case $choice in
+      check) wait_for "Esperando a Docker Desktop" 300 docker_desktop_ready || true ;;
+      continue) warn "Se continúa con poca memoria para Docker."; return 0 ;;
+      *) die "Instalación detenida. Aumenta la memoria de Docker Desktop y vuelve a ejecutar '$APP_CMD instalar'." ;;
+    esac
+  done
+}
+
+start_docker_engine() {
+  if ! systemctl is-active --quiet docker 2>/dev/null; then
+    ensure_sudo
+    run "Arrancando el servicio de Docker" sudo systemctl enable --now docker.service || die "No se pudo arrancar Docker."
+  else
+    ok "El servicio de Docker está en marcha"
+  fi
+  if ! in_group_db docker; then
+    ensure_sudo
+    run "Añadiendo tu usuario al grupo docker" sudo usermod -aG docker "$USER" || true
+    DOCKER_GROUP_ADDED=1
+  fi
+  set_docker_cmd
+  wait_for "Comprobando que Docker responde" 120 docker_ready || die "Docker no responde. Prueba: sudo systemctl status docker"
+}
+
+docker_pull() {  # docker_pull imagen → 0 si se descarga
+  local img="$1" errf="$TMP_DIR/pull.err"
+  if (( DRY_RUN )); then
+    printf '%s docker pull %s\n' "${C_DIM}[simulación]${C_RESET}" "$img"
+    return 0
+  fi
+  log "PULL $img"
+  if "${DOCKER[@]}" pull "$img" 2>"$errf"; then return 0; fi
+  cat "$errf" >&2
+  cat "$errf" >>"$LOG_FILE"
+  # Docker Desktop sin «pass» inicializado puede fallar al consultar credenciales:
+  # se reintenta de forma anónima (las imágenes de Oracle Free son públicas).
+  if [[ $ENGINE == desktop ]] && grep -qi 'error getting credentials' "$errf"; then
+    warn "Reintentando la descarga sin el almacén de credenciales de Docker Desktop..."
+    mkdir -p "$TMP_DIR/docker-anon"
+    printf '{}\n' >"$TMP_DIR/docker-anon/config.json"
+    if DOCKER_CONFIG="$TMP_DIR/docker-anon" docker -H "unix://$HOME/.docker/desktop/docker.sock" pull "$img" 2>"$errf"; then
+      return 0
+    fi
+    cat "$errf" >&2
+  fi
+  return 1
+}
+
+pull_image() {
+  if image_exists "$IMAGE"; then
+    ok "La imagen ya está descargada: $IMAGE"
+    return 0
+  fi
+  make_tmp
+  local attempt
+  for attempt in 1 2 3; do
+    info "Descargando $IMAGE (intento $attempt de 3). Puede tardar bastante según tu conexión..."
+    if docker_pull "$IMAGE"; then
+      ok "Imagen descargada: $IMAGE"
+      return 0
+    fi
+    if is_oracle_registry_image "$IMAGE" \
+      && grep -qiE 'objectstorage|oraclecloud|i/o timeout|no such host|connection refused|tls' "$TMP_DIR/pull.err" 2>/dev/null; then
+      break
+    fi
+    if (( attempt < 3 )); then
+      warn "La descarga ha fallado; se reintenta en 10 segundos."
+      sleep 10
+    fi
+  done
+  if is_oracle_registry_image "$IMAGE"; then
+    local alt_key alt
+    alt_key=$(hub_equivalent_key "$IMAGE_KEY")
+    alt=$(catalog_field "$alt_key" 2)
+    if ui_yesno "No se pudo descargar la imagen oficial" "No se ha podido descargar la imagen oficial de Oracle. Casi siempre es porque la red bloquea el almacenamiento de Oracle Cloud (pasa en algunas redes de centros educativos).
+
+¿Descargar en su lugar la imagen equivalente de Docker Hub?
+
+   $alt" si; then
+      IMAGE_KEY="$alt_key"
+      IMAGE="$alt"
+      pull_image
+      return
+    fi
+  fi
+  die "No se pudo descargar la imagen $IMAGE. Revisa tu conexión y vuelve a ejecutar '$APP_CMD instalar'."
+}
+
+wait_db() {  # wait_db nueva|reinicio → espera a que la base de datos esté lista
+  local mode="$1" timeout=1800 start=$SECONDS i=0 frames='|/-\' st state restarts logs last
+  if (( DRY_RUN )); then
+    printf '%s Esperar el mensaje «DATABASE IS READY TO USE!»\n' "${C_DIM}[simulación]${C_RESET}"
+    return 0
+  fi
+  if [[ $mode == reinicio ]]; then
+    timeout=900
+    if db_sql_ready; then ok "Base de datos abierta y lista"; return 0; fi
+  fi
+  if [[ $mode == nueva ]]; then
+    info "Oracle está creando la base de datos: tarda entre 2 y 15 minutos. No cierres esta ventana."
+  else
+    info "Arrancando Oracle (normalmente menos de un minuto)..."
+  fi
+  while true; do
+    st=$("${DOCKER[@]}" inspect -f '{{.State.Status}} {{.RestartCount}}' "$CONTAINER_NAME" 2>/dev/null) || st="missing 0"
+    state=${st%% *}
+    restarts=${st##* }
+    if [[ $state != running ]] || (( restarts > 0 )); then
+      [[ -t 1 ]] && printf '\r\e[K'
+      err "El contenedor se ha detenido de forma inesperada (estado: $state)."
+      print_container_logs 40
+      return 1
+    fi
+    logs=$("${DOCKER[@]}" logs --since "$CONTAINER_SINCE" "$CONTAINER_NAME" 2>&1) || logs=""
+    if [[ $logs == *"DATABASE IS READY TO USE"* ]]; then break; fi
+    if [[ $logs == *"DATABASE SETUP WAS NOT SUCCESSFUL"* ]]; then
+      [[ -t 1 ]] && printf '\r\e[K'
+      err "La creación de la base de datos ha fallado."
+      print_container_logs 40
+      return 1
+    fi
+    if [[ $mode == reinicio ]] && db_sql_ready; then break; fi
+    if (( SECONDS - start > timeout )); then
+      [[ -t 1 ]] && printf '\r\e[K'
+      err "Oracle no ha terminado de arrancar en $((timeout / 60)) minutos."
+      print_container_logs 30
+      return 1
+    fi
+    if [[ -t 1 ]]; then
+      last=$(printf '%s\n' "$logs" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-45) || last=""
+      printf '\r\e[K %s Preparando Oracle... %s  %s' "${C_CYAN}${frames:i++%4:1}${C_RESET}" \
+        "$(fmt_time $((SECONDS - start)))" "${C_DIM}${last}${C_RESET}"
+    fi
+    sleep 4
+  done
+  [[ -t 1 ]] && printf '\r\e[K'
+  ok "Base de datos lista (en $(fmt_time $((SECONDS - start))))"
+}
+
+create_or_reuse_container() {
+  local state fresh=1
+  state=$(container_state)
+  if [[ -n $state && -z $EXISTING_ACTION ]]; then ask_existing_container "$state"; fi
+  if [[ -n $state ]]; then
+    case $EXISTING_ACTION in
+      keep)
+        if [[ $state != running ]]; then
+          CONTAINER_SINCE=$(( $(date +%s) - 5 ))
+          run "Arrancando el contenedor existente '$CONTAINER_NAME'" "${DOCKER[@]}" start "$CONTAINER_NAME" \
+            || die "No se pudo arrancar el contenedor existente."
+        else
+          ok "El contenedor '$CONTAINER_NAME' ya está en marcha"
+        fi
+        wait_db reinicio || die "La base de datos del contenedor existente no arranca. Prueba a reinstalar eligiendo «Borrarlo TODO»."
+        return 0
+        ;;
+      recreate)
+        run "Eliminando el contenedor anterior (los datos se conservan)" "${DOCKER[@]}" rm -f "$CONTAINER_NAME" \
+          || die "No se pudo eliminar el contenedor anterior."
+        ;;
+      wipe)
+        run "Eliminando el contenedor anterior" "${DOCKER[@]}" rm -f "$CONTAINER_NAME" \
+          || die "No se pudo eliminar el contenedor anterior."
+        if (( DATA_IS_BIND )); then
+          warn "Los datos antiguos estaban en la carpeta $VOLUME_NAME: no se toca (bórrala tú si ya no la quieres)."
+          VOLUME_NAME="${CONTAINER_NAME}-datos"
+          DATA_IS_BIND=0
+        fi
+        if volume_exists; then
+          run "Eliminando el volumen de datos anterior" "${DOCKER[@]}" volume rm -f "$VOLUME_NAME" \
+            || die "No se pudo eliminar el volumen anterior."
+        fi
+        ;;
+    esac
+  fi
+  if (( DATA_IS_BIND )); then
+    fresh=0
+    info "Se reutilizan los datos existentes de la carpeta $VOLUME_NAME."
+  else
+    if volume_exists; then
+      fresh=0
+      info "Se reutilizan los datos existentes del volumen '$VOLUME_NAME'."
+    fi
+    run "Creando el volumen de datos '$VOLUME_NAME'" "${DOCKER[@]}" volume create "$VOLUME_NAME" \
+      || die "No se pudo crear el volumen de datos."
+  fi
+  local args=(run -d --name "$CONTAINER_NAME"
+    -p "$BIND_ADDR:$HOST_PORT:1521"
+    -v "$VOLUME_NAME:/opt/oracle/oradata"
+    --restart "$RESTART_POLICY"
+    --label "oracle23ai.gestionado-por=oracle23ai.sh")
+  # Sin contraseña en variables de entorno: la imagen genera una aleatoria temporal
+  # y después se cambia por la tuya vía SQL (así no queda en 'docker inspect').
+  if is_gvenzl_image "$IMAGE"; then
+    args+=(-e ORACLE_RANDOM_PASSWORD=yes)
+  else
+    args+=(-e ORACLE_CHARACTERSET=AL32UTF8)
+  fi
+  args+=("$IMAGE")
+  CONTAINER_SINCE=$(( $(date +%s) - 5 ))
+  run "Creando y arrancando el contenedor '$CONTAINER_NAME'" "${DOCKER[@]}" "${args[@]}" \
+    || die "No se pudo crear el contenedor. ¿Está ocupado el puerto $HOST_PORT? Compruébalo con: ss -ltnp | grep $HOST_PORT"
+  if (( fresh )); then
+    wait_db nueva || die "La base de datos no se ha podido crear. Revisa los mensajes anteriores."
+  else
+    wait_db reinicio || die "La base de datos no ha arrancado con los datos existentes."
+  fi
+}
+
+configure_db() {
+  { admin_sql "$ADMIN_PWD"; printf 'EXIT SUCCESS\n'; } \
+    | run_sql_script "Contraseña de SYS, SYSTEM y PDBADMIN configurada" \
+    || die "No se pudo configurar la contraseña de administración."
+  if [[ -n $APP_USER ]]; then
+    { printf 'ALTER SESSION SET CONTAINER = %s;\n' "$PDB_NAME"; user_sql "$APP_USER" "$APP_PWD"; printf 'EXIT SUCCESS\n'; } \
+      | run_sql_script "Usuario $APP_USER listo en $PDB_NAME (rol DB_DEVELOPER_ROLE)" \
+      || die "No se pudo crear el usuario $APP_USER."
+  fi
+  (( DRY_RUN )) && return 0
+  if verify_login SYSTEM "$ADMIN_PWD"; then
+    ok "Conexión comprobada: SYSTEM@$PDB_NAME"
+  else
+    warn "No se pudo comprobar la conexión de SYSTEM (revisa con: $APP_CMD sql system)."
+  fi
+  if [[ -n $APP_USER ]]; then
+    if verify_login "$APP_USER" "$APP_PWD"; then
+      ok "Conexión comprobada: $APP_USER@$PDB_NAME"
+    else
+      warn "No se pudo comprobar la conexión de $APP_USER."
+    fi
+  fi
+}
+
+write_wrapper() {  # write_wrapper destino programa [línea extra]
+  local dest="$1" target="$2" extra="${3:-}"
+  if (( DRY_RUN )); then
+    printf '%s crear %s -> %s\n' "${C_DIM}[simulación]${C_RESET}" "$dest" "$target"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  {
+    printf '#!/bin/sh\n# Creado por oracle23ai.sh\n'
+    if [[ -n $extra ]]; then printf '%s\n' "$extra"; fi
+    printf 'exec "%s" "$@"\n' "$target"
+  } >"$dest"
+  chmod 0755 "$dest"
+}
+
+unpack_zip() {  # unpack_zip "descripción" zip carpeta_destino (se reemplaza)
+  run "$1" bash -c 'rm -rf -- "$3" && mkdir -p "$2" && unzip -q "$1" -d "$2"' _ "$2" "$(dirname "$3")" "$3"
+}
+
+java_major() {
+  local v
+  v=$(java -version 2>&1 | awk -F'"' '/version/ {print $2; exit}') || v=""
+  v=${v#1.}
+  printf '%s' "${v%%.*}"
+}
+
+install_sqlcl() {
+  local major
+  major=$(java_major 2>/dev/null) || major=""
+  if [[ ! $major =~ ^[0-9]+$ ]] || (( major < 17 )); then
+    apt_install "Java 17 para SQLcl" openjdk-17-jre-headless || return 1
+  fi
+  apt_install "unzip" unzip || return 1
+  make_tmp
+  info "Descargando SQLcl (~120 MB)..."
+  download "$SQLCL_URL" "$TMP_DIR/sqlcl.zip" || return 1
+  if (( ! DRY_RUN )) && ! unzip -tq "$TMP_DIR/sqlcl.zip" >/dev/null 2>&1; then
+    err "El archivo de SQLcl está dañado."
+    return 1
+  fi
+  unpack_zip "Instalando SQLcl en $DATA_DIR/sqlcl" "$TMP_DIR/sqlcl.zip" "$DATA_DIR/sqlcl" || return 1
+  write_wrapper "$BIN_DIR/sql" "$DATA_DIR/sqlcl/bin/sql"
+  ok "SQLcl instalado: comando 'sql'"
+}
+
+install_sqldeveloper() {
+  local jdk
+  jdk="/usr/lib/jvm/java-17-openjdk-$(dpkg --print-architecture)"
+  apt_install "JDK 17 para SQL Developer" openjdk-17-jdk || return 1
+  apt_install "unzip" unzip || return 1
+  make_tmp
+  info "Descargando SQL Developer 24.3.1 (~560 MB)..."
+  download "$SQLDEV_URL" "$TMP_DIR/sqldeveloper.zip" || return 1
+  if (( ! DRY_RUN )) && ! unzip -tq "$TMP_DIR/sqldeveloper.zip" >/dev/null 2>&1; then
+    err "El archivo de SQL Developer está dañado."
+    return 1
+  fi
+  unpack_zip "Instalando SQL Developer en $DATA_DIR/sqldeveloper" "$TMP_DIR/sqldeveloper.zip" "$DATA_DIR/sqldeveloper" || return 1
+  if (( ! DRY_RUN )); then
+    # Indicar el JDK para que no lo pregunte en el primer arranque
+    printf '\n# Añadido por oracle23ai.sh\nSetJavaHome %s\n' "$jdk" \
+      >>"$DATA_DIR/sqldeveloper/sqldeveloper/bin/sqldeveloper.conf"
+    chmod +x "$DATA_DIR/sqldeveloper/sqldeveloper.sh"
+    mkdir -p "$APPS_DIR"
+    cat >"$APPS_DIR/oracle23ai-sqldeveloper.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Oracle SQL Developer
+Comment=Cliente gráfico para Oracle Database (instalado por oracle23ai.sh)
+Exec="$BIN_DIR/sqldeveloper"
+Icon=$DATA_DIR/sqldeveloper/icon.png
+Terminal=false
+Categories=Development;Database;
+EOF
+  fi
+  write_wrapper "$BIN_DIR/sqldeveloper" "$DATA_DIR/sqldeveloper/sqldeveloper.sh" "export JAVA_HOME=\"$jdk\""
+  ok "SQL Developer instalado: búscalo en el menú de aplicaciones o ejecuta 'sqldeveloper'"
+}
+
+install_extras() {
+  if [[ -z $EXTRAS ]]; then
+    ok "Sin herramientas opcionales (SQL*Plus del contenedor: '$APP_CMD sql')"
+    return 0
+  fi
+  if [[ " $EXTRAS " == *" sqlcl "* ]]; then
+    install_sqlcl || warn "SQLcl no se pudo instalar. Puedes reintentarlo con '$APP_CMD instalar'."
+  fi
+  if [[ " $EXTRAS " == *" sqldeveloper "* ]]; then
+    install_sqldeveloper || warn "SQL Developer no se pudo instalar. Puedes reintentarlo con '$APP_CMD instalar'."
+  fi
+  return 0
+}
+
+install_helper() {
+  local self
+  self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) || self=""
+  if [[ -z $self || ! -f $self ]]; then
+    warn "No se pudo instalar el comando '$APP_CMD' (el script no se está ejecutando desde un archivo)."
+    return 0
+  fi
+  if [[ -e $BIN_DIR/$APP_CMD && $self -ef $BIN_DIR/$APP_CMD ]]; then
+    ok "Comando '$APP_CMD' ya instalado en $BIN_DIR"
+    return 0
+  fi
+  run "Instalando el comando '$APP_CMD' en $BIN_DIR" install -D -m 0755 "$self" "$BIN_DIR/$APP_CMD" \
+    || warn "No se pudo instalar el comando '$APP_CMD'."
+  return 0
+}
+
+save_config() {
+  if (( DRY_RUN )); then
+    printf '%s guardar la configuración (sin contraseñas) en %s\n' "${C_DIM}[simulación]${C_RESET}" "$CONFIG_FILE"
+    return 0
+  fi
+  local k
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+  {
+    printf '# Configuración de %s (generada automáticamente; no contiene contraseñas)\n' "$APP_CMD"
+    for k in "${CONFIG_KEYS[@]}"; do printf '%s=%s\n' "$k" "${!k}"; done
+  } >"$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+}
+
+load_config() {  # carga solo claves conocidas y valores con caracteres seguros
+  [[ -r $CONFIG_FILE ]] || return 1
+  local line key value safe='^[A-Za-z0-9_.:/@ -]*$'
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ $line =~ ^([A-Z_]+)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    [[ " ${CONFIG_KEYS[*]} " == *" $key "* ]] || continue
+    [[ $value =~ $safe ]] || continue
+    printf -v "$key" '%s' "$value"
+  done <"$CONFIG_FILE"
+  valid_container_name "$CONTAINER_NAME" || CONTAINER_NAME="oracle23ai"
+  [[ $HOST_PORT =~ ^[1-9][0-9]{3,4}$ ]] || HOST_PORT="1521"
+  [[ $BIND_ADDR == 0.0.0.0 ]] || BIND_ADDR="127.0.0.1"
+  [[ -n $VOLUME_NAME ]] || VOLUME_NAME="${CONTAINER_NAME}-datos"
+  return 0
+}
+
+require_config() {
+  load_config || die "No hay ninguna instalación registrada. Ejecuta primero: $APP_CMD instalar"
+  [[ -n $ENGINE ]] || ENGINE="desktop"
+  set_docker_cmd
+}
+
+connection_text() {
+  local host_note="" user_hint="${APP_USER:-SYSTEM}"
+  [[ $BIND_ADDR == 0.0.0.0 ]] && host_note="  (o la IP de este equipo desde tu red)"
+  cat <<EOF
+Datos de conexión
+  Host ............. localhost$host_note
+  Puerto ........... $HOST_PORT
+  Servicio (PDB) ... $PDB_NAME   <- usa este para tus prácticas
+  Servicio (CDB) ... $CDB_NAME
+  Tu usuario ....... ${APP_USER:-(no creado)}
+  Administración ... SYSTEM · SYS (como SYSDBA) · PDBADMIN
+
+Cadenas de conexión
+  SQL*Plus / SQLcl . $user_hint@//localhost:$HOST_PORT/$PDB_NAME
+  JDBC ............. jdbc:oracle:thin:@//localhost:$HOST_PORT/$PDB_NAME
+  SQL Developer .... Tipo «Básico» · Host localhost · Puerto $HOST_PORT · Nombre del servicio $PDB_NAME
+
+Uso diario
+  $APP_CMD estado · iniciar · parar · sql · sysdba · info · password · logs · desinstalar
+EOF
+}
+
+write_info_file() {
+  if (( DRY_RUN )); then
+    printf '%s guardar los datos de conexión en %s\n' "${C_DIM}[simulación]${C_RESET}" "$INFO_FILE"
+    return 0
+  fi
+  mkdir -p "$CONFIG_DIR"
+  {
+    printf 'Oracle Database Free · contenedor %s · imagen %s\n' "$CONTAINER_NAME" "$IMAGE"
+    printf 'Generado el %(%F %H:%M)T (las contraseñas no se guardan)\n\n' -1
+    connection_text
+  } >"$INFO_FILE"
+  chmod 600 "$INFO_FILE"
+}
+
+show_final_summary() {
+  if (( DRY_RUN )); then
+    printf '\n%s\n' "${C_BOLD}Simulación terminada: no se ha cambiado nada.${C_RESET}"
+    return 0
+  fi
+  printf '\n%s\n' "${C_GREEN}${C_BOLD}$S_RULE${C_RESET}"
+  printf '%s\n' "${C_GREEN}${C_BOLD}  $S_OK ¡Oracle Database Free está listo para usar!${C_RESET}"
+  printf '%s\n\n' "${C_GREEN}${C_BOLD}$S_RULE${C_RESET}"
+  connection_text
+  printf '\n'
+  if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    info "Para usar '$APP_CMD' en ESTA terminal ejecuta: source ~/.profile (tras reiniciar sesión funciona siempre)."
+  fi
+  info "Las contraseñas no se guardan en ningún sitio: apúntalas. Si olvidas una: $APP_CMD password"
+  info "La contraseña aleatoria que aparece en 'docker logs' era temporal: ya no sirve."
+  if (( DOCKER_GROUP_ADDED )); then
+    info "Te he añadido al grupo docker: tras cerrar sesión podrás usar 'docker' sin sudo."
+  fi
+  info "Datos de conexión guardados en: $INFO_FILE"
+  info "Registro de la instalación: $LOG_FILE"
+}
+
+install_run() {
+  make_tmp
+  STEP_N=0
+  if [[ $ENGINE == desktop ]]; then STEP_TOTAL=8; else STEP_TOTAL=7; fi
+  step "Paquetes básicos del sistema"
+  install_base_packages
+  if [[ $ENGINE == desktop ]]; then
+    step "Virtualización (KVM)"
+    setup_kvm
+    step "Docker Desktop"
+    install_docker_desktop
+  else
+    step "Docker Engine"
+    install_docker_engine
+  fi
+  step "Arrancando Docker"
+  start_docker
+  step "Imagen de Oracle Database"
+  pull_image
+  step "Contenedor de Oracle"
+  create_or_reuse_container
+  step "Contraseñas y usuario de trabajo"
+  configure_db
+  step "Herramientas y comando '$APP_CMD'"
+  install_extras
+  install_helper
+  INSTALL_STAGE="completo"
+  INSTALLED_AT=$(date '+%F %H:%M')
+  save_config
+  write_info_file
+  show_final_summary
+}
+
+# =============================================================================
+#  Comandos
+# =============================================================================
+cmd_install() {
+  init_log instalacion
+  ui_init
+  load_config || true
+  preflight_collect
+  local m
+  for m in "${PF_OK[@]}"; do log "OK    $m"; done
+  if (( ${#PF_ERR[@]} )); then
+    for m in "${PF_WARN[@]}"; do warn "$m"; done
+    for m in "${PF_ERR[@]}"; do err "$m"; done
+    ui_msg "No se puede instalar" "$(printf -- '- %s\n' "${PF_ERR[@]}")"
+    die "Corrige los problemas anteriores y vuelve a ejecutar '$0 instalar'."
+  fi
+  if (( ${#PF_WARN[@]} )); then
+    for m in "${PF_WARN[@]}"; do warn "$m"; done
+    ui_yesno "Avisos" "Se han encontrado estos avisos:
+
+$(printf -- '- %s\n\n' "${PF_WARN[@]}")¿Quieres continuar?" si || cancelled
+  fi
+  [[ $INSTALL_STAGE == relogin ]] && info "Continuando la instalación que quedó pendiente de cerrar sesión."
+  wizard
+  [[ -t 1 ]] && clear
+  printf '%s\n' "${C_BOLD}$APP_NAME · v$APP_VERSION${C_RESET}"
+  info "Registro detallado: $LOG_FILE"
+  install_run
+}
+
+ensure_docker_running() {
+  docker_ready && return 0
+  if [[ $ENGINE == desktop ]]; then
+    run "Abriendo Docker Desktop" systemctl --user start docker-desktop || die "No se pudo arrancar Docker Desktop."
+    wait_for "Esperando a Docker Desktop" 600 docker_ready \
+      || die "Docker Desktop no arranca. Ábrelo desde el menú de aplicaciones y revisa si muestra algún error."
+  else
+    ensure_sudo
+    run "Arrancando el servicio de Docker" sudo systemctl start docker.service || die "No se pudo arrancar Docker."
+    set_docker_cmd
+    wait_for "Esperando a Docker" 120 docker_ready || die "Docker no responde. Prueba: sudo systemctl status docker"
+  fi
+}
+
+ensure_container_running() {
+  ensure_docker_running
+  local state
+  state=$(container_state)
+  [[ -n $state ]] || die "No existe el contenedor '$CONTAINER_NAME'. Ejecuta: $APP_CMD instalar"
+  if [[ $state != running ]]; then
+    CONTAINER_SINCE=$(( $(date +%s) - 5 ))
+    run "Arrancando el contenedor '$CONTAINER_NAME'" "${DOCKER[@]}" start "$CONTAINER_NAME" \
+      || die "No se pudo arrancar el contenedor."
+  fi
+  wait_db reinicio || die "La base de datos no está disponible. Mira qué ocurre con: $APP_CMD logs"
+}
+
+cmd_start() {
+  require_config
+  init_log oracle23ai anexar
+  ensure_container_running
+  printf '\n'
+  connection_text
+}
+
+cmd_stop() {
+  require_config
+  init_log oracle23ai anexar
+  if ! docker_ready; then
+    ok "Docker no está en marcha: Oracle ya está detenido."
+    return 0
+  fi
+  if [[ $(container_state) == running ]]; then
+    run "Deteniendo Oracle de forma ordenada (hasta 2 minutos)" "${DOCKER[@]}" stop -t 120 "$CONTAINER_NAME" \
+      || die "No se pudo detener el contenedor."
+  else
+    ok "Oracle ya estaba detenido."
+  fi
+  if [[ $ENGINE == desktop ]]; then
+    if (( ! STOP_ALL )) && [[ -t 0 && -t 1 ]]; then
+      ui_init
+      if ui_yesno "Cerrar Docker Desktop" "¿Cerrar también Docker Desktop para liberar memoria?" no; then STOP_ALL=1; fi
+    fi
+    if (( STOP_ALL )); then
+      run "Cerrando Docker Desktop" systemctl --user stop docker-desktop || true
+    fi
+  fi
+}
+
+cmd_status() {
+  require_config
+  local label state health img ports
+  if [[ $ENGINE == desktop ]]; then label="Docker Desktop"; else label="Docker Engine"; fi
+  printf '%s\n' "${C_BOLD}Oracle Database Free · estado${C_RESET}"
+  if ! docker_ready; then
+    printf '  %-13s %s\n' "Docker:" "$label (detenido)"
+    info "Arráncalo todo con: $APP_CMD iniciar"
+    return 0
+  fi
+  printf '  %-13s %s\n' "Docker:" "$label (en marcha)"
+  state=$(container_state)
+  if [[ -z $state ]]; then
+    warn "No existe el contenedor '$CONTAINER_NAME'. Ejecuta: $APP_CMD instalar"
+    return 0
+  fi
+  health=$("${DOCKER[@]}" inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$CONTAINER_NAME" 2>/dev/null) || health=""
+  img=$("${DOCKER[@]}" inspect -f '{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null) || img="?"
+  ports=$("${DOCKER[@]}" port "$CONTAINER_NAME" 1521/tcp 2>/dev/null) || ports=""
+  printf '  %-13s %s\n' "Contenedor:" "$CONTAINER_NAME ($state${health:+, $health})"
+  printf '  %-13s %s\n' "Imagen:" "$img"
+  ports="${ports%%$'\n'*}"
+  printf '  %-13s %s\n' "Puerto:" "${ports:-$BIND_ADDR:$HOST_PORT}"
+  printf '  %-13s %s\n' "Datos:" "volumen $VOLUME_NAME"
+  if [[ $state == running ]]; then
+    if db_sql_ready; then
+      ok "Base de datos $PDB_NAME abierta: lista para conectar."
+    else
+      warn "El contenedor está en marcha pero la base de datos aún no está abierta (¿arrancando?). Mira: $APP_CMD logs"
+    fi
+  else
+    info "Oracle está detenido. Arráncalo con: $APP_CMD iniciar"
+  fi
+}
+
+cmd_sql() {
+  require_config
+  ensure_container_running
+  local user="${1:-${APP_USER:-SYSTEM}}"
+  [[ $user =~ ^[A-Za-z][A-Za-z0-9_]{0,127}$ ]] || die "Nombre de usuario no válido: $user"
+  if [[ -t 0 && -t 1 ]]; then
+    info "Conectando como ${user^^} a $PDB_NAME (para salir escribe: exit)"
+    exec "${DOCKER[@]}" exec -it "$CONTAINER_NAME" sqlplus -L "$user@//localhost:1521/$PDB_NAME"
+  fi
+  # Sin terminal (p. ej. «oracle23ai sql < script.sql»): SQL*Plus no puede pedir la
+  # contraseña, así que la entrada debe empezar con una línea CONNECT.
+  printf '%s\n' "(Sin terminal: la entrada debe empezar con CONNECT usuario/contraseña@//localhost:1521/$PDB_NAME)" >&2
+  exec "${DOCKER[@]}" exec -i "$CONTAINER_NAME" sqlplus -s -L /nolog
+}
+
+cmd_sysdba() {
+  require_config
+  ensure_container_running
+  local tty=(-i)
+  [[ -t 0 && -t 1 ]] && tty=(-it)
+  info "Conectando como SYSDBA al CDB (usa ALTER SESSION SET CONTAINER = $PDB_NAME; para ir a la PDB)"
+  exec "${DOCKER[@]}" exec "${tty[@]}" "$CONTAINER_NAME" sqlplus / as sysdba
+}
+
+cmd_sqlcl() {
+  require_config
+  [[ -x $BIN_DIR/sql ]] || die "SQLcl no está instalado. Instálalo con '$APP_CMD instalar' (herramientas opcionales)."
+  ensure_container_running
+  local user="${1:-${APP_USER:-SYSTEM}}"
+  [[ $user =~ ^[A-Za-z][A-Za-z0-9_]{0,127}$ ]] || die "Nombre de usuario no válido: $user"
+  exec "$BIN_DIR/sql" "$user@//localhost:$HOST_PORT/$PDB_NAME"
+}
+
+cmd_logs() {
+  require_config
+  ensure_docker_running
+  info "Registro del contenedor '$CONTAINER_NAME' (Ctrl+C para salir)"
+  exec "${DOCKER[@]}" logs -f --tail 100 "$CONTAINER_NAME"
+}
+
+cmd_info() {
+  require_config
+  printf '%s\n\n' "${C_BOLD}Oracle Database Free · contenedor $CONTAINER_NAME · imagen $IMAGE${C_RESET}"
+  connection_text
+}
+
+cmd_password() {
+  require_config
+  init_log oracle23ai anexar
+  ui_init
+  ensure_container_running
+  local opts=(admin "SYS, SYSTEM y PDBADMIN (administración)") target user pwd problem
+  [[ -n $APP_USER ]] && opts+=(app "Tu usuario de trabajo ($APP_USER)")
+  opts+=(otro "Otro usuario de $PDB_NAME")
+  target=$(ui_menu "Cambiar contraseña" "¿Qué contraseña quieres cambiar? (también desbloquea la cuenta si estaba bloqueada)" \
+    "${APP_USER:+app}" "${opts[@]}") || exit 1
+  case $target in
+    admin)
+      pwd=$(ask_new_password "SYS, SYSTEM y PDBADMIN") || exit 1
+      { admin_sql "$pwd"; printf 'EXIT SUCCESS\n'; } | run_sql_script "Contraseña de administración cambiada" || exit 1
+      ;;
+    app|otro)
+      if [[ $target == app ]]; then
+        user="$APP_USER"
+      else
+        while true; do
+          user=$(ui_input "Usuario" "Nombre del usuario de $PDB_NAME:" "") || exit 1
+          if problem=$(user_problem "$user"); then ui_msg "Nombre no válido" "$problem"; continue; fi
+          break
+        done
+        user="${user^^}"
+      fi
+      pwd=$(ask_new_password "el usuario $user") || exit 1
+      { alter_user_sql "$user" "$pwd"; printf 'EXIT SUCCESS\n'; } | run_sql_script "Contraseña de $user cambiada (y cuenta desbloqueada)" || exit 1
+      ;;
+  esac
+}
+
+cmd_create_user() {
+  require_config
+  init_log oracle23ai anexar
+  ui_init
+  ensure_container_running
+  local user pwd problem
+  while true; do
+    user=$(ui_input "Nuevo usuario" "Nombre del nuevo usuario de $PDB_NAME (letras sin tildes, números y _):" "") || exit 1
+    if problem=$(user_problem "$user"); then ui_msg "Nombre no válido" "$problem"; continue; fi
+    break
+  done
+  user="${user^^}"
+  pwd=$(ask_new_password "el usuario $user") || exit 1
+  { printf 'ALTER SESSION SET CONTAINER = %s;\n' "$PDB_NAME"; user_sql "$user" "$pwd"; printf 'EXIT SUCCESS\n'; } \
+    | run_sql_script "Usuario $user creado en $PDB_NAME (rol DB_DEVELOPER_ROLE)" || exit 1
+  if verify_login "$user" "$pwd"; then ok "Conexión comprobada: $user@$PDB_NAME"; fi
+  info "Conéctate con: $APP_CMD sql $user"
+}
+
+cmd_check() {
+  local m
+  printf '%s\n' "${C_BOLD}Sistema${C_RESET}"
+  preflight_collect
+  for m in "${PF_OK[@]}"; do ok "$m"; done
+  for m in "${PF_WARN[@]}"; do warn "$m"; done
+  for m in "${PF_ERR[@]}"; do err "$m"; done
+  printf '\n%s\n' "${C_BOLD}Docker${C_RESET}"
+  if (( DD_INSTALLED )); then ok "Docker Desktop instalado ($(pkg_version docker-desktop))"; else info "Docker Desktop no instalado"; fi
+  if (( ENGINE_INSTALLED )); then ok "Docker Engine instalado ($(pkg_version docker-ce))"; else info "Docker Engine no instalado"; fi
+  if [[ -e /dev/kvm ]]; then
+    if [[ -r /dev/kvm && -w /dev/kvm ]]; then ok "Acceso a /dev/kvm"; else warn "Sin acceso a /dev/kvm: añade tu usuario al grupo kvm y cierra sesión."; fi
+  else
+    info "No existe /dev/kvm (virtualización no disponible o módulos sin cargar)"
+  fi
+  if docker_desktop_ready; then ok "Docker Desktop en marcha"; elif (( DD_INSTALLED )); then info "Docker Desktop detenido"; fi
+  if docker --context default info >/dev/null 2>&1; then ok "Docker Engine en marcha"; fi
+  printf '\n%s\n' "${C_BOLD}Red${C_RESET}"
+  if oracle_storage_ok; then
+    ok "Registro oficial de Oracle: accesible"
+  else
+    warn "Almacenamiento de Oracle Cloud bloqueado o inaccesible: usa una imagen de Docker Hub (gvenzl)."
+  fi
+  if dockerhub_ok; then ok "Docker Hub: accesible"; else warn "Docker Hub no accesible"; fi
+  printf '\n%s\n' "${C_BOLD}Instalación${C_RESET}"
+  if load_config; then
+    [[ -n $ENGINE ]] || ENGINE="desktop"
+    set_docker_cmd nosudo
+    ok "Configuración: contenedor $CONTAINER_NAME, puerto $BIND_ADDR:$HOST_PORT, imagen $IMAGE"
+    if docker_ready; then
+      local state
+      state=$(container_state)
+      if [[ -n $state ]]; then ok "Contenedor $CONTAINER_NAME: $state"; else warn "El contenedor $CONTAINER_NAME no existe"; fi
+    fi
+  else
+    info "No hay ninguna instalación registrada (ejecuta: $0 instalar)"
+  fi
+}
+
+cmd_uninstall() {
+  init_log desinstalacion
+  ui_init
+  load_config || warn "No se encontró configuración guardada: se usan los valores por defecto."
+  if [[ -z $ENGINE ]]; then
+    if pkg_installed docker-desktop; then ENGINE="desktop"; else ENGINE="engine"; fi
+  fi
+  set_docker_cmd
+  local items=() choice confirm
+  items+=(contenedor "Contenedor '$CONTAINER_NAME'" ON)
+  items+=(datos "Datos: volumen '$VOLUME_NAME' (¡borra tus tablas!)" OFF)
+  [[ -n $IMAGE ]] && items+=(imagen "Imagen $IMAGE" OFF)
+  if [[ -e $DATA_DIR/sqlcl || -e $DATA_DIR/sqldeveloper ]]; then
+    items+=(extras "SQLcl y SQL Developer instalados por esta herramienta" OFF)
+  fi
+  if [[ $ENGINE == desktop ]] && pkg_installed docker-desktop; then
+    items+=(docker "Docker Desktop entero (con TODOS sus contenedores e imágenes)" OFF)
+  fi
+  items+=(comando "El comando '$APP_CMD', su configuración y sus registros" ON)
+  choice=$(ui_checklist "Desinstalar" "Marca lo que quieres eliminar (barra espaciadora para marcar):" "${items[@]}") || exit 0
+  if [[ -z $choice ]]; then
+    info "No se ha marcado nada: no se elimina nada."
+    return 0
+  fi
+  has() { [[ " $choice " == *" $1 "* ]]; }
+  if has datos || has docker; then
+    confirm=$(ui_input "Confirmar borrado de datos" "Vas a borrar DEFINITIVAMENTE datos de la base de datos. No se puede deshacer.
+Escribe BORRAR para confirmar:" "") || exit 1
+    [[ $confirm == BORRAR ]] || die "Confirmación incorrecta: no se ha borrado nada."
+  fi
+  if has contenedor || has datos || has imagen; then
+    if ensure_docker_running; then
+      if [[ -n $(container_state) ]]; then
+        run "Eliminando el contenedor '$CONTAINER_NAME'" "${DOCKER[@]}" rm -f "$CONTAINER_NAME" || true
+      fi
+      if has datos; then
+        run "Eliminando el volumen de datos '$VOLUME_NAME'" "${DOCKER[@]}" volume rm -f "$VOLUME_NAME" || true
+      fi
+      if has imagen; then
+        run "Eliminando la imagen $IMAGE" "${DOCKER[@]}" image rm "$IMAGE" || true
+      fi
+    fi
+  fi
+  if has extras; then
+    run "Eliminando SQLcl y SQL Developer" rm -rf -- "$DATA_DIR/sqlcl" "$DATA_DIR/sqldeveloper" \
+      "$BIN_DIR/sql" "$BIN_DIR/sqldeveloper" "$APPS_DIR/oracle23ai-sqldeveloper.desktop" || true
+  fi
+  if has docker; then
+    ensure_sudo
+    run "Cerrando Docker Desktop" systemctl --user stop docker-desktop || true
+    run "Desactivando su inicio automático" systemctl --user disable docker-desktop || true
+    run "Desinstalando Docker Desktop" sudo env DEBIAN_FRONTEND=noninteractive apt-get purge -y docker-desktop || true
+    run "Borrando la máquina virtual de Docker Desktop" rm -rf -- "$HOME/.docker/desktop" || true
+    run "Borrando /usr/local/bin/com.docker.cli" sudo rm -f /usr/local/bin/com.docker.cli || true
+    if [[ -f $HOME/.docker/config.json ]] && command -v python3 >/dev/null 2>&1; then
+      run "Limpiando ~/.docker/config.json" python3 - "$HOME/.docker/config.json" <<'PY' || true
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(0)
+changed = False
+if cfg.get("credsStore") == "desktop":
+    cfg.pop("credsStore"); changed = True
+if cfg.get("currentContext") == "desktop-linux":
+    cfg.pop("currentContext"); changed = True
+if changed:
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+PY
+    fi
+  fi
+  if has comando; then
+    local log_copy="${TMPDIR:-/tmp}/oracle23ai-desinstalacion.log"
+    [[ -n $LOG_FILE && -f $LOG_FILE ]] && cp "$LOG_FILE" "$log_copy" 2>/dev/null
+    LOG_FILE=""
+    run "Eliminando el comando '$APP_CMD', su configuración y registros" \
+      rm -rf -- "$BIN_DIR/$APP_CMD" "$CONFIG_DIR" "$STATE_DIR" || true
+    [[ -f $log_copy ]] && info "Copia del registro de esta desinstalación: $log_copy"
+  fi
+  ok "Desinstalación terminada."
+}
+
+cmd_help() {
+  cat <<EOF
+${C_BOLD}$APP_NAME · v$APP_VERSION${C_RESET}
+
+Uso: $APP_CMD [comando] [opciones]      (sin comando abre un menú)
+
+${C_BOLD}Instalación${C_RESET}
+  instalar           Asistente que instala y configura todo (Docker + Oracle)
+  comprobar          Revisa requisitos, red y estado (útil si algo falla)
+  desinstalar        Elimina lo que elijas: contenedor, datos, imagen, Docker...
+
+${C_BOLD}Uso diario${C_RESET}
+  estado             ¿Están en marcha Docker y la base de datos?
+  iniciar            Arranca Docker (si hace falta) y Oracle
+  parar [--todo]     Detiene Oracle (con --todo también cierra Docker Desktop)
+  sql [usuario]      SQL*Plus conectado a $PDB_NAME (por defecto, tu usuario)
+  sysdba             SQL*Plus como SYSDBA (administración)
+  sqlcl [usuario]    SQLcl desde tu Ubuntu (si lo instalaste)
+  info               Datos de conexión (host, puerto, servicio...)
+  password           Cambiar o desbloquear contraseñas
+  crear-usuario      Crear otro usuario en $PDB_NAME
+  logs               Registro del contenedor (Ctrl+C para salir)
+
+${C_BOLD}Opciones${C_RESET}
+  --simular          Muestra lo que haría sin cambiar nada
+  --sin-tui          Preguntas en texto plano, sin ventanas
+  -h, --ayuda        Esta ayuda
+  -V, --version      Versión
+EOF
+}
+
+cmd_menu() {
+  ui_init
+  local choice installed=0
+  if load_config && [[ $INSTALL_STAGE == completo ]]; then installed=1; fi
+  if (( installed )); then
+    choice=$(ui_menu "$APP_NAME" "Contenedor: $CONTAINER_NAME · Puerto: $HOST_PORT · Servicio: $PDB_NAME
+
+¿Qué quieres hacer?" estado \
+      estado "Ver el estado de la base de datos" \
+      iniciar "Arrancar Oracle (y Docker si hace falta)" \
+      parar "Detener Oracle" \
+      sql "Abrir SQL*Plus con tu usuario" \
+      info "Ver los datos de conexión" \
+      password "Cambiar o desbloquear contraseñas" \
+      crear-usuario "Crear otro usuario" \
+      logs "Ver el registro del contenedor" \
+      comprobar "Comprobar requisitos y red" \
+      instalar "Reinstalar o reparar" \
+      desinstalar "Desinstalar" \
+      salir "Salir") || exit 0
+  else
+    choice=$(ui_menu "$APP_NAME" "Instala y deja lista Oracle Database 23ai Free en Ubuntu con Docker.
+
+¿Qué quieres hacer?" instalar \
+      instalar "Instalar Oracle Database 23ai Free (asistente)" \
+      comprobar "Comprobar requisitos y red antes de instalar" \
+      ayuda "Ver todos los comandos" \
+      salir "Salir") || exit 0
+  fi
+  [[ $choice == salir ]] && exit 0
+  [[ -t 1 && $USE_TUI == 1 ]] && clear
+  dispatch "$choice"
+}
+
+dispatch() {
+  local cmd="${1:-}"
+  (( $# )) && shift
+  case $cmd in
+    instalar|install) cmd_install ;;
+    estado|status) cmd_status ;;
+    iniciar|arrancar|start) cmd_start ;;
+    parar|detener|stop) cmd_stop ;;
+    sql|sqlplus|conectar) cmd_sql "$@" ;;
+    sysdba) cmd_sysdba ;;
+    sqlcl) cmd_sqlcl "$@" ;;
+    logs|log) cmd_logs ;;
+    info|conexion) cmd_info ;;
+    password|contrasena|contraseña) cmd_password ;;
+    crear-usuario|usuario) cmd_create_user ;;
+    comprobar|check|diagnostico) cmd_check ;;
+    desinstalar|uninstall) cmd_uninstall ;;
+    ayuda|help) cmd_help ;;
+    *) err "Comando desconocido: $cmd"; cmd_help; exit 1 ;;
+  esac
+}
+
+main() {
+  setup_output
+  local cmd="" args=()
+  while (( $# )); do
+    case $1 in
+      --simular|--dry-run) DRY_RUN=1 ;;
+      --sin-tui|--no-tui|--texto) USE_TUI=0 ;;
+      --todo|--all) STOP_ALL=1 ;;
+      -h|--help|--ayuda) cmd="ayuda" ;;
+      -V|--version) printf '%s %s\n' "$APP_CMD" "$APP_VERSION"; exit 0 ;;
+      -*) die "Opción desconocida: $1 (usa '$APP_CMD ayuda')" ;;
+      *) if [[ -z $cmd ]]; then cmd="$1"; else args+=("$1"); fi ;;
+    esac
+    shift
+  done
+  if (( EUID == 0 )); then
+    die "No ejecutes esta herramienta como root ni con sudo: usa tu usuario normal (./oracle23ai.sh). Pedirá la contraseña cuando haga falta."
+  fi
+  trap cleanup EXIT
+  trap on_interrupt INT TERM
+  trap 'on_error "$LINENO"' ERR
+  if [[ -z $cmd ]]; then
+    cmd_menu
+  else
+    dispatch "$cmd" "${args[@]}"
+  fi
+}
+
+main "$@"

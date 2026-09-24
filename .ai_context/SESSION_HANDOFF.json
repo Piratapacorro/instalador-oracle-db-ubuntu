@@ -1,0 +1,32 @@
+{
+  "project": "instalador-oracle23ai-ubuntu",
+  "updated": "2026-09-24",
+  "entrypoint": "oracle23ai.sh",
+  "language": "bash (UI y documentación en español)",
+  "version": "1.0.0",
+  "defaults": {
+    "container": "oracle23ai",
+    "volume": "oracle23ai-datos",
+    "port": 1521,
+    "bind": "127.0.0.1",
+    "pdb": "FREEPDB1",
+    "profile": "PERFIL_PRACTICAS",
+    "image_official": "container-registry.oracle.com/database/free:23.9.0.0",
+    "image_fallback": "docker.io/gvenzl/oracle-free:23.9"
+  },
+  "design": {
+    "secrets": "Nunca en disco/argv/env: la imagen arranca con contraseña aleatoria y se cambia con SQL por stdin (sqlplus / as sysdba).",
+    "readiness": "Base nueva: esperar 'DATABASE IS READY TO USE!' en docker logs --since; reinicio: v$pdbs READ WRITE.",
+    "docker_cmd": "desktop -> docker --context desktop-linux; engine -> docker --context default (o sudo docker).",
+    "config": "~/.config/oracle23ai/config (clave=valor, lista blanca, sin contraseñas)",
+    "logs": "~/.local/state/oracle23ai/",
+    "network_block": "Si objectstorage.*.oraclecloud.com resuelve a IP privada o no conecta, se propone Docker Hub."
+  },
+  "tested_real": ["docker-engine path", "gvenzl 23.9", "keep existing container", "password", "crear-usuario", "parar/iniciar", "desinstalar"],
+  "tested_simulated_only": ["docker-desktop install/start", "official Oracle image pull", "sqlcl", "sqldeveloper"],
+  "next_steps": [
+    "Probar en Ubuntu 24.04 limpio con Docker Desktop real",
+    "Probar imagen oficial en red sin bloqueo",
+    "Revisar resultado de ShellCheck en GitHub Actions"
+  ]
+}
