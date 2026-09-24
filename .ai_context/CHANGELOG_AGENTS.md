@@ -28,3 +28,8 @@
 - Reinstalación «conservar contenedor» mostraba el puerto por defecto → ahora se lee del contenedor.
 - `oracle23ai sql` sin terminal no podía pedir la contraseña → modo `/nolog` (entrada con `CONNECT`).
 - Textos de preguntas en modo texto con «::» duplicados → formato de pregunta unificado.
+
+### Publicación y CI
+- `gh repo create instalador-oracle23ai-ubuntu --public --source . --push` (commit 40481a0).
+- CI detectó 6 avisos de ShellCheck (SC2194, SC2155, SC2174, SC2178/SC2128, SC2034) → corregidos en a1a1aa4; CI en verde.
+- Eliminadas funciones sin uso (`in_group_now`, `desktop_capable`).

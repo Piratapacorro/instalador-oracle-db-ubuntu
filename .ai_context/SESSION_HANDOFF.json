@@ -22,11 +22,29 @@
     "logs": "~/.local/state/oracle23ai/",
     "network_block": "Si objectstorage.*.oraclecloud.com resuelve a IP privada o no conecta, se propone Docker Hub."
   },
-  "tested_real": ["docker-engine path", "gvenzl 23.9", "keep existing container", "password", "crear-usuario", "parar/iniciar", "desinstalar"],
-  "tested_simulated_only": ["docker-desktop install/start", "official Oracle image pull", "sqlcl", "sqldeveloper"],
+  "tested_real": [
+    "docker-engine path",
+    "gvenzl 23.9",
+    "keep existing container",
+    "password",
+    "crear-usuario",
+    "parar/iniciar",
+    "desinstalar"
+  ],
+  "tested_simulated_only": [
+    "docker-desktop install/start",
+    "official Oracle image pull",
+    "sqlcl",
+    "sqldeveloper"
+  ],
   "next_steps": [
     "Probar en Ubuntu 24.04 limpio con Docker Desktop real",
-    "Probar imagen oficial en red sin bloqueo",
-    "Revisar resultado de ShellCheck en GitHub Actions"
-  ]
+    "Probar imagen oficial en red sin bloqueo"
+  ],
+  "repository": "https://github.com/Piratapacorro/instalador-oracle23ai-ubuntu",
+  "ci": {
+    "workflow": ".github/workflows/comprobaciones.yml",
+    "status": "success",
+    "last_green_commit": "a1a1aa4"
+  }
 }

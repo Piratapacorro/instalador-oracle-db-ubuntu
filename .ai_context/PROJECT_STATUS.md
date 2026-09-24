@@ -25,6 +25,10 @@ necesarios en un asistente (whiptail, con modo texto alternativo).
 | Imagen oficial `container-registry.oracle.com/database/free` | ⚠️ | No descargable en la red de pruebas (bloqueo); lógica compartida con gvenzl |
 | SQLcl / SQL Developer (opcionales) | ⚠️ | Solo simulación (URLs verificadas con HEAD) |
 
+## Publicación
+- Repositorio: https://github.com/Piratapacorro/instalador-oracle23ai-ubuntu (público, rama `main`).
+- CI «Comprobaciones» (bash -n, ShellCheck --severity=warning, ayuda, comprobar): ✅ en verde.
+
 ## Riesgos conocidos / pendientes
 - Probar en un Ubuntu 24.04 limpio con Docker Desktop real (aceptación del acuerdo, memoria de la VM).
 - Probar la imagen oficial de Oracle en una red sin bloqueo.
