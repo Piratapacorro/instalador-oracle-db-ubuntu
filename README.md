@@ -1,16 +1,18 @@
 # Instalador de Oracle Database 23ai Free para Ubuntu 24.04 (Docker Desktop)
 
-Herramienta que **instala todo lo necesario y deja lista una base de datos Oracle Database 23ai Free**
-en Ubuntu 24.04 LTS usando Docker Desktop. Te hace unas preguntas en ventanas (nombre, puerto,
-contraseñas, usuario…) y hace el resto sola.
+Herramienta con **interfaz gráfica** que **instala todo lo necesario y deja lista una base de datos
+Oracle Database Free** (23ai o 26ai) en Ubuntu 24.04 LTS usando Docker Desktop. Te hace unas preguntas
+en ventanas (nombre, imagen, puerto, contraseñas, usuario…) y hace el resto sola, con una barra de progreso.
 
 Al terminar tendrás:
 
 - **Docker Desktop** instalado y funcionando (con KVM y el repositorio oficial de Docker).
-- **Oracle Database 23ai Free** en un contenedor, con los datos en un **volumen persistente**.
+- **Oracle Database Free** en un contenedor, con los datos en un **volumen persistente**.
 - Tus **contraseñas** puestas en SYS, SYSTEM y PDBADMIN.
 - Un **usuario de trabajo** para tus prácticas (por ejemplo `ALUMNO`) en la base de datos `FREEPDB1`.
-- El comando **`oracle23ai`** para arrancar, parar, conectarte, cambiar contraseñas, etc.
+- La aplicación **«Oracle Database Free»** en el menú de aplicaciones: un panel para arrancar, detener,
+  conectarte, cambiar contraseñas, crear usuarios…
+- El comando **`oracle23ai`** para hacer lo mismo desde la terminal.
 - Opcional: **SQLcl** y **SQL Developer** en tu Ubuntu.
 
 ---
@@ -49,25 +51,39 @@ chmod +x oracle23ai.sh
 ./oracle23ai.sh instalar
 ```
 
-> Ejecútalo con **tu usuario normal**, no con `sudo`: la herramienta pedirá la contraseña cuando haga falta.
-> Si prefieres ver antes lo que hará sin cambiar nada: `./oracle23ai.sh --simular instalar`.
+> Ejecútalo con **tu usuario normal**, no con `sudo`: la herramienta te pedirá la contraseña en una
+> ventana cuando haga falta. Si prefieres ver antes lo que hará sin cambiar nada:
+> `./oracle23ai.sh --simular instalar`.
 
-### Qué te va a preguntar
+¿Te piden **26ai** (la versión más nueva) en lugar de 23ai? Añade `--oracle 26ai`:
 
-| Pregunta | Valor recomendado (pulsa Enter) |
+```bash
+./oracle23ai.sh --oracle 26ai instalar
+```
+
+### Las ventanas del asistente
+
+| Ventana | Qué hacer (lo recomendado ya viene marcado) |
 |---|---|
+| Bienvenida | **Empezar** |
 | Motor de contenedores | Docker Desktop |
 | Nombre del contenedor | `oracle23ai` |
-| Imagen de Oracle | 23ai (23.9); si tu red bloquea Oracle Cloud te propondrá la de Docker Hub |
+| Imagen de Oracle | la marcada como recomendada: 23ai (23.9), o 26ai con `--oracle 26ai`. Si tu red bloquea Oracle Cloud, te propondrá la de Docker Hub |
 | Puerto | `1521` |
-| ¿Acceso desde otros equipos? | No (solo desde tu equipo) |
-| Contraseña de administración | *la que tú elijas* (SYS, SYSTEM y PDBADMIN) |
-| Usuario de trabajo | `alumno` y *su contraseña* |
-| Arranque automático | Oracle sí; Docker Desktop al iniciar sesión, no |
-| Herramientas opcionales | SQLcl y/o SQL Developer (si las quieres) |
+| Opciones | crear usuario de trabajo ✔, arrancar Oracle con Docker ✔, acceso desde la red ✘, SQLcl / SQL Developer si los quieres |
+| Usuario de trabajo | `alumno` (o el nombre que quieras) |
+| Contraseñas | las tuyas: administración (SYS, SYSTEM, PDBADMIN) y la de tu usuario (vacía = la misma) |
+| Resumen | **Instalar** |
+| Contraseña de administrador | tu contraseña de Ubuntu (la de iniciar sesión) |
+
+Después una **barra de progreso** muestra cada paso, cuánto falta de la descarga y la preparación de Oracle.
+Al final, una ventana te enseña los datos de conexión.
 
 Las contraseñas deben tener **8-30 caracteres**, empezar por letra e incluir **mayúscula, minúscula y número**
 (solo letras sin tildes, números, `_` y `#`). **No se guardan en ningún sitio: apúntalas.**
+
+> **¿Sin escritorio o prefieres la terminal?** `./oracle23ai.sh --tui instalar` hace las mismas
+> preguntas en ventanas dentro de la terminal, y `--texto` las hace en texto plano.
 
 ### El único paso manual: aceptar el acuerdo de Docker
 
@@ -110,9 +126,22 @@ host `localhost`, puerto `1521`, **Nombre del servicio** `FREEPDB1` (¡no «SID�
 
 ## Uso diario
 
+### Con ventanas: la aplicación «Oracle Database Free»
+
+Búscala en el menú de aplicaciones de Ubuntu (tecla Super y escribe *Oracle*). Abre un panel que te dice
+si Oracle está en marcha y te deja:
+
+- **Arrancar** y **detener** Oracle (y cerrar Docker Desktop para liberar memoria).
+- Abrir **SQL*Plus** con tu usuario o como SYSDBA (en una terminal).
+- Ver los **datos de conexión**, el **estado detallado** y el **registro** de Oracle.
+- **Cambiar o desbloquear contraseñas** y **crear otros usuarios**.
+- Hacer un **diagnóstico**, **reinstalar** o **desinstalar**.
+
+### Con la terminal
+
 | Comando | Qué hace |
 |---|---|
-| `oracle23ai` | Menú con todas las opciones |
+| `oracle23ai` | Abre el panel (ventanas) o un menú en la terminal |
 | `oracle23ai estado` | ¿Están en marcha Docker y la base de datos? |
 | `oracle23ai iniciar` | Arranca Docker (si hace falta) y Oracle |
 | `oracle23ai parar` | Detiene Oracle de forma ordenada (`--todo` cierra también Docker Desktop) |
@@ -165,6 +194,7 @@ a la de Docker Hub. En casa normalmente funcionan las dos.
 | Repositorio de Docker | `/etc/apt/sources.list.d/docker.sources` y `/etc/apt/keyrings/docker.asc` |
 | Máquina virtual de Docker Desktop (imágenes y volúmenes) | `~/.docker/desktop/` |
 | Comando `oracle23ai` | `~/.local/bin/oracle23ai` |
+| Acceso «Oracle Database Free» del menú (e icono) | `~/.local/share/applications/oracle23ai.desktop` y `~/.local/share/oracle23ai/oracle23ai.svg` |
 | Configuración (sin contraseñas) y datos de conexión | `~/.config/oracle23ai/` |
 | Registros de instalación | `~/.local/state/oracle23ai/` |
 | SQLcl / SQL Developer (opcionales) | `~/.local/share/oracle23ai/` |

@@ -10,6 +10,31 @@ Los registros detallados de cada instalación están en `~/.local/state/oracle23
 
 ---
 
+## Las ventanas (interfaz gráfica)
+
+### No veo la ventana del asistente
+
+Puede haberse abierto **detrás de otras ventanas**: búscala con `Alt + Tab`. Las ventanas se llaman
+«Bienvenida», «Opciones», «Contraseñas», etc.
+
+### No aparece ninguna ventana
+
+- Si estás conectado por SSH o no tienes escritorio, usa las ventanas de terminal: `./oracle23ai.sh --tui instalar`.
+- Si falta zenity (el programa que dibuja las ventanas): `sudo apt install zenity`, o usa `--tui`.
+
+### Me vuelve a pedir la «Contraseña de administrador»
+
+- Si la escribes mal, la ventana aparece otra vez (Ubuntu da tres intentos).
+- Si la instalación dura más de 15 minutos, Ubuntu puede volver a pedirla para los últimos pasos. Es normal.
+
+### La barra de progreso parece parada
+
+Las descargas grandes (Docker Desktop y la imagen de Oracle) y la primera preparación de Oracle tardan varios
+minutos. El texto de la ventana dice qué está haciendo y cuánto tiempo lleva. Si quieres más detalle, mira el
+registro en `~/.local/state/oracle23ai/`.
+
+---
+
 ## Durante la instalación
 
 ### «La descarga de la imagen oficial falla» (`i/o timeout`, `objectstorage…oraclecloud.com`)
