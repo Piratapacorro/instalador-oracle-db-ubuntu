@@ -4,16 +4,18 @@
 #  para Ubuntu 24.04 LTS con Docker Desktop (o Docker Engine si no hay KVM).
 #
 #  Uso:
-#     ./oracle23ai.sh                  Menú interactivo
+#     ./oracle23ai.sh                  Panel (ventanas gráficas si hay escritorio)
 #     ./oracle23ai.sh instalar         Asistente de instalación
+#     ./oracle23ai.sh --tui instalar   El asistente en ventanas de terminal
 #     ./oracle23ai.sh ayuda            Lista de comandos
 #
-#  Tras instalar queda disponible el comando «oracle23ai» (en ~/.local/bin).
+#  Tras instalar quedan el comando «oracle23ai» (en ~/.local/bin) y el acceso
+#  «Oracle Database Free» en el menú de aplicaciones.
 #  Licencia: MIT
 # =============================================================================
 set -Eeuo pipefail
 
-readonly APP_VERSION="1.0.0"
+readonly APP_VERSION="1.1.0"
 readonly APP_CMD="oracle23ai"
 readonly APP_NAME="Instalador Oracle Database 23ai Free"
 
@@ -66,7 +68,16 @@ readonly PWD_RULES="Requisitos: 8 a 30 caracteres, empezar por letra y tener al 
 
 # --- Estado de ejecución -------------------------------------------------------
 DRY_RUN=0
-USE_TUI=1
+UI_MODE="auto"          # auto | gui | tui | texto
+GUI_READY=0
+GUI_FD=""               # descriptor de la ventana de progreso (modo gráfico)
+GUI_FIFO=""
+GUI_PROGRESS_PID=""
+GUI_BUSY=0
+GUI_STEP_TEXT=""
+GUI_INFO_PID=""
+SUDO=(sudo)             # en modo gráfico: sudo -A (contraseña en una ventana)
+ORACLE_PREF=""          # 23ai | 26ai (opción --oracle)
 STOP_ALL=0
 SUDO_READY=0
 SUDO_KEEPALIVE_PID=""
@@ -126,14 +137,15 @@ log() {
   if [[ -n $LOG_FILE ]]; then printf '[%(%F %T)T] %s\n' -1 "$*" >>"$LOG_FILE"; fi
   return 0
 }
-info() { printf '%s %s\n' "${C_BLUE}${S_INFO}${C_RESET}" "$*"; log "INFO  $*"; }
-ok()   { printf '%s %s\n' "${C_GREEN}${S_OK}${C_RESET}" "$*"; log "OK    $*"; }
-warn() { printf '%s %s\n' "${C_YELLOW}${S_WARN}${C_RESET}" "$*" >&2; log "AVISO $*"; }
-err()  { printf '%s %s\n' "${C_RED}${S_ERR}${C_RESET}" "$*" >&2; log "ERROR $*"; }
+info() { printf '%s %s\n' "${C_BLUE}${S_INFO}${C_RESET}" "$*"; log "INFO  $*"; gui_note "$*"; }
+ok()   { printf '%s %s\n' "${C_GREEN}${S_OK}${C_RESET}" "$*"; log "OK    $*"; gui_note "$S_OK $*"; }
+warn() { printf '%s %s\n' "${C_YELLOW}${S_WARN}${C_RESET}" "$*" >&2; log "AVISO $*"; gui_note "$S_WARN $*"; }
+err()  { printf '%s %s\n' "${C_RED}${S_ERR}${C_RESET}" "$*" >&2; log "ERROR $*"; gui_note "$S_ERR $*"; }
 
 die() {
   err "$*"
   if [[ -n $LOG_FILE ]]; then printf '  %s\n' "Registro completo: $LOG_FILE" >&2; fi
+  gui_error "$*"
   exit 1
 }
 
@@ -141,6 +153,8 @@ step() {
   STEP_N=$((STEP_N + 1))
   printf '\n%s\n' "${C_BOLD}${C_CYAN}[$STEP_N/$STEP_TOTAL] $*${C_RESET}"
   log "==== [$STEP_N/$STEP_TOTAL] $*"
+  GUI_STEP_TEXT="[$STEP_N/$STEP_TOTAL] $*"
+  gui_progress_send "$(( (STEP_N - 1) * 100 / STEP_TOTAL ))" "# $GUI_STEP_TEXT"
 }
 
 init_log() {  # init_log nombre [anexar]
@@ -169,6 +183,7 @@ on_error() {
   log "ERR código=$rc línea=$line orden=${BASH_COMMAND}"
   err "Se ha producido un error inesperado (código $rc, línea $line)."
   if [[ -n $LOG_FILE ]]; then err "Revisa el registro: $LOG_FILE"; fi
+  gui_error "Se ha producido un error inesperado (código $rc, línea $line)."
   return 0
 }
 
@@ -179,6 +194,8 @@ on_interrupt() {
 }
 
 cleanup() {
+  gui_progress_close
+  if [[ -n $GUI_INFO_PID ]]; then kill "$GUI_INFO_PID" 2>/dev/null || true; fi
   if [[ -n $SUDO_KEEPALIVE_PID ]]; then kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true; fi
   if [[ -n $TMP_DIR && -d $TMP_DIR ]]; then rm -rf -- "$TMP_DIR"; fi
   if [[ -t 1 ]]; then tput cnorm 2>/dev/null || true; fi
@@ -209,6 +226,7 @@ run() {  # run "descripción" orden [args...]
     return 0
   fi
   log "EJECUTA $desc: $(quote_cmd "$@")"
+  gui_note "$desc..."
   local rc=0 out="${LOG_FILE:-/dev/null}"
   if [[ -t 1 ]]; then
     "$@" >>"$out" 2>&1 </dev/null &
@@ -246,6 +264,7 @@ wait_for() {  # wait_for "descripción" segundos orden [args...]
     if [[ -t 1 ]]; then
       printf '\r\e[K %s %s (%s)' "${C_CYAN}${frames:i++%4:1}${C_RESET}" "$desc" "$(fmt_time $((SECONDS - start)))"
     fi
+    gui_note "$desc ($(fmt_time $((SECONDS - start))))"
     sleep 3
   done
   [[ -t 1 ]] && printf '\r\e[K'
@@ -267,21 +286,154 @@ download() {  # download URL destino
 }
 
 # =============================================================================
-#  Interfaz: ventanas con whiptail o preguntas en texto plano
-#  (todo lo que se dibuja va a stderr; los valores elegidos salen por stdout)
+#  Interfaz: ventanas gráficas (zenity), ventanas de terminal (whiptail) o texto
+#  Lo que se dibuja va a la pantalla o a stderr; los valores elegidos, a stdout.
 # =============================================================================
+gui_available() { command -v zenity >/dev/null 2>&1 && [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]]; }
+
 ui_init() {
-  if (( USE_TUI )) && command -v whiptail >/dev/null 2>&1 && [[ -t 0 && -t 2 ]]; then
-    local lines cols
-    lines=$(tput lines 2>/dev/null || echo 0)
-    cols=$(tput cols 2>/dev/null || echo 0)
-    if (( lines < 20 || cols < 70 )); then USE_TUI=0; fi
-  else
-    USE_TUI=0
+  if [[ $UI_MODE == auto ]]; then
+    if gui_available; then UI_MODE="gui"; else UI_MODE="tui"; fi
+  fi
+  if [[ $UI_MODE == gui ]]; then
+    if gui_available; then
+      gui_setup
+      return 0
+    fi
+    warn "No hay escritorio gráfico o falta zenity: se usan ventanas de terminal."
+    UI_MODE="tui"
+  fi
+  if [[ $UI_MODE == tui ]]; then
+    local lines=0 cols=0
+    if command -v whiptail >/dev/null 2>&1 && [[ -t 0 && -t 2 ]]; then
+      lines=$(tput lines 2>/dev/null || echo 0)
+      cols=$(tput cols 2>/dev/null || echo 0)
+    fi
+    if (( lines >= 20 && cols >= 70 )); then return 0; fi
+    UI_MODE="texto"
   fi
   return 0
 }
 
+strip_ansi() { sed 's/\x1b\[[0-9;]*[A-Za-z]//g'; }
+
+# --- Modo gráfico (zenity) ----------------------------------------------------
+zen() { zenity "$@" 2>/dev/null; }   # oculta los avisos internos de GTK
+
+gui_setup() {
+  (( GUI_READY )) && return 0
+  GUI_READY=1
+  make_tmp
+  # sudo pedirá la contraseña en una ventana (sudo -A) en lugar de en la terminal
+  cat >"$TMP_DIR/pedir-contrasena.sh" <<'EOF'
+#!/bin/sh
+exec zenity --entry --hide-text --title="Contraseña de administrador" --width=480 \
+  --text="El instalador de Oracle necesita la contraseña de tu usuario de Ubuntu (la de iniciar sesión) para instalar programas." \
+  --ok-label="Aceptar" --cancel-label="Cancelar" 2>/dev/null
+EOF
+  chmod 700 "$TMP_DIR/pedir-contrasena.sh"
+  export SUDO_ASKPASS="$TMP_DIR/pedir-contrasena.sh"
+  SUDO=(sudo -A)
+  return 0
+}
+
+gui_list_height() {  # gui_list_height "texto" filas → alto en píxeles
+  local lines=0 line h
+  while IFS= read -r line; do lines=$((lines + 1 + ${#line} / 80)); done <<<"$1"
+  h=$((170 + lines * 22 + $2 * 40))
+  if (( h > 720 )); then h=720; fi
+  if (( h < 280 )); then h=280; fi
+  printf '%s' "$h"
+}
+
+gui_progress_open() {  # gui_progress_open "texto" [pulsate]
+  [[ $UI_MODE == gui ]] || return 0
+  if [[ -n $GUI_FD ]]; then gui_progress_send "# $1"; return 0; fi
+  make_tmp
+  GUI_FIFO="$TMP_DIR/progreso-$RANDOM"
+  mkfifo -m 600 "$GUI_FIFO"
+  local opts=(--progress --title="$APP_NAME" --text="$1" --width=640 --no-cancel --auto-close)
+  [[ ${2:-} == pulsate ]] && opts+=(--pulsate)
+  zen "${opts[@]}" <"$GUI_FIFO" >/dev/null &
+  GUI_PROGRESS_PID=$!
+  exec {GUI_FD}>"$GUI_FIFO"
+  return 0
+}
+
+gui_progress_send() {  # envía líneas a la ventana de progreso (si sigue abierta)
+  [[ -n $GUI_FD ]] || return 0
+  kill -0 "$GUI_PROGRESS_PID" 2>/dev/null || return 0
+  ( printf '%s\n' "$@" >&"$GUI_FD" ) 2>/dev/null || true
+  return 0
+}
+
+gui_progress_close() {
+  [[ -n $GUI_FD ]] || return 0
+  gui_progress_send 100
+  exec {GUI_FD}>&-
+  GUI_FD=""
+  sleep 0.2
+  kill "$GUI_PROGRESS_PID" 2>/dev/null || true
+  wait "$GUI_PROGRESS_PID" 2>/dev/null || true
+  rm -f "$GUI_FIFO"
+  return 0
+}
+
+gui_note() {  # gui_note "texto": actualiza el texto de la ventana de progreso
+  [[ -n $GUI_FD ]] || return 0
+  local msg="${1//$'\n'/ }"
+  if [[ -n $GUI_STEP_TEXT ]]; then
+    gui_progress_send "# $GUI_STEP_TEXT\\n$msg"
+  else
+    gui_progress_send "# $msg"
+  fi
+}
+
+gui_show_text() {  # gui_show_text "título" "texto" (letra de ancho fijo)
+  printf '%s\n' "$2" | zen --text-info --title="$1" --width=860 --height=560 --font="Monospace 10" \
+    --ok-label="Aceptar" --cancel-label="Cerrar" >/dev/null || true
+}
+
+gui_show_file() {  # gui_show_file "título" fichero
+  zen --text-info --title="$1" --filename="$2" --width=920 --height=600 --font="Monospace 9" \
+    --ok-label="Aceptar" --cancel-label="Cerrar" >/dev/null || true
+}
+
+gui_error() {  # ventana de error con acceso al registro
+  [[ $UI_MODE == gui && -z ${GUI_QUIET_ERRORS:-} ]] || return 0
+  gui_progress_close
+  local msg="$1" btn="" args=(--error --title="$APP_NAME" --no-markup --width=580 --ok-label="Cerrar")
+  if [[ -n $LOG_FILE && -f $LOG_FILE ]]; then
+    msg+=$'\n\n'"Registro: $LOG_FILE"
+    args+=(--extra-button="Ver registro")
+  fi
+  btn=$(zen "${args[@]}" --text="$msg") || true
+  if [[ $btn == "Ver registro" ]]; then gui_show_file "Registro" "$LOG_FILE"; fi
+  return 0
+}
+
+open_in_terminal() {  # open_in_terminal "título" subcomando [args...]
+  local title="$1" self script
+  shift
+  self=$(readlink -f "${BASH_SOURCE[0]}")
+  # shellcheck disable=SC2016  # $0 y $@ se expanden dentro de la terminal nueva
+  script='"$0" --tui "$@"; echo; read -r -p "Pulsa Enter para cerrar esta ventana... " _'
+  if command -v gnome-terminal >/dev/null 2>&1; then
+    gnome-terminal --title="$title" -- bash -c "$script" "$self" "$@" >/dev/null 2>&1 &
+  elif command -v x-terminal-emulator >/dev/null 2>&1; then
+    x-terminal-emulator -e bash -c "$script" "$self" "$@" >/dev/null 2>&1 &
+  else
+    ui_msg "No hay terminal" "No se encontró ninguna terminal. Abre una y ejecuta: $APP_CMD $*"
+  fi
+  return 0
+}
+
+ui_done() {  # confirmación final de una acción (solo hace falta en modo gráfico)
+  if [[ $UI_MODE == gui ]]; then ui_msg "Hecho" "$1"; fi
+  return 0
+}
+
+# --- Modo terminal (whiptail) -------------------------------------------------
 ui_backtitle() {
   local t="$APP_NAME · v$APP_VERSION"
   (( DRY_RUN )) && t+=" · MODO SIMULACIÓN (no se cambia nada)"
@@ -310,39 +462,56 @@ ui_dims() {  # ui_dims "texto" filas_extra
 
 wt() { whiptail --backtitle "$(ui_backtitle)" "$@" 3>&1 1>&2 2>&3; }
 
-# Nota: no se usa --scrolltext porque con él Enter no pulsa «Aceptar» (el foco se
-# queda en el texto); por eso los textos son cortos y las ventanas se dimensionan.
+# --- Funciones comunes a los tres modos -----------------------------------------
+# Nota: en whiptail no se usa --scrolltext porque con él Enter no pulsa «Aceptar»
+# (el foco se queda en el texto); por eso los textos son cortos.
 ui_msg() {  # ui_msg "título" "texto"
-  if (( USE_TUI )); then
-    ui_dims "$2" 7
-    whiptail --backtitle "$(ui_backtitle)" --title "$1" --ok-button "Aceptar" \
-      --msgbox "$2" "$UI_H" "$UI_W" >&2 || true
-  else
-    printf '\n%s\n%s\n' "${C_BOLD}── $1 ──${C_RESET}" "$2" >&2
-  fi
+  case $UI_MODE in
+    gui)
+      zen --info --title="$1" --text="$2" --no-markup --width=580 --ok-label="Aceptar" || true ;;
+    tui)
+      ui_dims "$2" 7
+      whiptail --backtitle "$(ui_backtitle)" --title "$1" --ok-button "Aceptar" \
+        --msgbox "$2" "$UI_H" "$UI_W" >&2 || true ;;
+    *)
+      printf '\n%s\n%s\n' "${C_BOLD}── $1 ──${C_RESET}" "$2" >&2 ;;
+  esac
   return 0
 }
 
-ui_info() {  # Aviso sin esperar respuesta
-  if (( USE_TUI )); then
-    ui_dims "$1" 5
-    whiptail --backtitle "$(ui_backtitle)" --title "Un momento" --infobox "$1" "$UI_H" "$UI_W" >&2 || true
-  else
-    printf '%s\n' "$1" >&2
-  fi
+ui_busy_start() {  # aviso de espera que se cierra solo («Comprobando la red...»)
+  case $UI_MODE in
+    gui)
+      if [[ -z $GUI_FD ]]; then GUI_BUSY=1; gui_progress_open "$1" pulsate; else gui_note "$1"; fi ;;
+    tui)
+      ui_dims "$1" 5
+      whiptail --backtitle "$(ui_backtitle)" --title "Un momento" --infobox "$1" "$UI_H" "$UI_W" >&2 || true ;;
+    *)
+      printf '%s\n' "$1" >&2 ;;
+  esac
   return 0
 }
 
-ui_yesno() {  # ui_yesno "título" "texto" [si|no] → 0 = sí
-  local def="${3:-si}"
-  if (( USE_TUI )); then
-    local extra=()
-    [[ $def == no ]] && extra=(--defaultno)
-    ui_dims "$2" 7
-    whiptail --backtitle "$(ui_backtitle)" --title "$1" --yes-button "Sí" --no-button "No" \
-      "${extra[@]}" --yesno "$2" "$UI_H" "$UI_W" >&2
-    return $?
-  fi
+ui_busy_stop() {
+  if (( GUI_BUSY )); then GUI_BUSY=0; gui_progress_close; fi
+  return 0
+}
+
+ui_yesno() {  # ui_yesno "título" "texto" [si|no] → 0 = sí (UI_YES / UI_NO cambian los botones)
+  local def="${3:-si}" extra=()
+  case $UI_MODE in
+    gui)
+      [[ $def == no ]] && extra=(--default-cancel)
+      zen --question --title="$1" --text="$2" --no-markup --width=580 \
+        --ok-label="${UI_YES:-Sí}" --cancel-label="${UI_NO:-No}" "${extra[@]}"
+      return $? ;;
+    tui)
+      [[ $def == no ]] && extra=(--defaultno)
+      ui_dims "$2" 7
+      whiptail --backtitle "$(ui_backtitle)" --title "$1" --yes-button "${UI_YES:-Sí}" --no-button "${UI_NO:-No}" \
+        "${extra[@]}" --yesno "$2" "$UI_H" "$UI_W" >&2
+      return $? ;;
+  esac
   local hint ans
   if [[ $def == no ]]; then hint="s/N"; else hint="S/n"; fi
   printf '\n%s\n%s\n%s ' "${C_BOLD}$1${C_RESET}" "$2" "¿Sí o no? [$hint]:" >&2
@@ -353,11 +522,16 @@ ui_yesno() {  # ui_yesno "título" "texto" [si|no] → 0 = sí
 }
 
 ui_input() {  # ui_input "título" "texto" "valor por defecto" → valor
-  if (( USE_TUI )); then
-    ui_dims "$2" 8
-    wt --title "$1" --ok-button "Aceptar" --cancel-button "Cancelar" --inputbox "$2" "$UI_H" "$UI_W" "$3"
-    return
-  fi
+  case $UI_MODE in
+    gui)
+      zen --entry --title="$1" --text="$2" --entry-text="$3" --width=540 \
+        --ok-label="Aceptar" --cancel-label="Cancelar"
+      return ;;
+    tui)
+      ui_dims "$2" 8
+      wt --title "$1" --ok-button "Aceptar" --cancel-button "Cancelar" --inputbox "$2" "$UI_H" "$UI_W" "$3"
+      return ;;
+  esac
   local ans
   printf '\n%s\n%s\n%s ' "${C_BOLD}$1${C_RESET}" "$2" "Respuesta${3:+ [$3]}:" >&2
   IFS= read -r ans || return 1
@@ -365,11 +539,16 @@ ui_input() {  # ui_input "título" "texto" "valor por defecto" → valor
 }
 
 ui_password() {  # ui_password "título" "texto" → contraseña
-  if (( USE_TUI )); then
-    ui_dims "$2" 8
-    wt --title "$1" --ok-button "Aceptar" --cancel-button "Cancelar" --passwordbox "$2" "$UI_H" "$UI_W"
-    return
-  fi
+  case $UI_MODE in
+    gui)
+      zen --entry --hide-text --title="$1" --text="$2" --width=540 \
+        --ok-label="Aceptar" --cancel-label="Cancelar"
+      return ;;
+    tui)
+      ui_dims "$2" 8
+      wt --title "$1" --ok-button "Aceptar" --cancel-button "Cancelar" --passwordbox "$2" "$UI_H" "$UI_W"
+      return ;;
+  esac
   local ans
   printf '\n%s\n%s\n%s ' "${C_BOLD}$1${C_RESET}" "$2" "Contraseña (no se ve al escribir):" >&2
   if [[ -t 0 ]]; then
@@ -384,15 +563,28 @@ ui_password() {  # ui_password "título" "texto" → contraseña
 ui_menu() {  # ui_menu "título" "texto" "clave por defecto" clave1 desc1 [clave2 desc2 ...]
   local title="$1" text="$2" def="$3"; shift 3
   local n=$(($# / 2)) list
-  if (( USE_TUI )); then
-    ui_dims "$text" $((n + 7))
-    list=$((UI_H - UI_TEXT - 7))   # si no cabe todo, la lista se desplaza con las flechas
-    if (( list > n )); then list=$n; fi
-    if (( list < 3 )); then list=3; fi
-    wt --title "$title" --ok-button "Aceptar" --cancel-button "Cancelar" --notags \
-      --default-item "$def" --menu "$text" "$UI_H" "$UI_W" "$list" "$@"
-    return
-  fi
+  case $UI_MODE in
+    gui)
+      local rows=() found=0
+      while (( $# )); do
+        if [[ $1 == "$def" ]]; then rows+=(TRUE); found=1; else rows+=(FALSE); fi
+        rows+=("$1" "$2")
+        shift 2
+      done
+      (( found )) || rows[0]=TRUE
+      zen --list --radiolist --title="$title" --text="$text" --width=680 --height="$(gui_list_height "$text" "$n")" \
+        --column="✓" --column="clave" --column="Opción" --hide-column=2 --print-column=2 --hide-header \
+        --ok-label="Aceptar" --cancel-label="Cancelar" "${rows[@]}"
+      return ;;
+    tui)
+      ui_dims "$text" $((n + 7))
+      list=$((UI_H - UI_TEXT - 7))   # si no cabe todo, la lista se desplaza con las flechas
+      if (( list > n )); then list=$n; fi
+      if (( list < 3 )); then list=3; fi
+      wt --title "$title" --ok-button "Aceptar" --cancel-button "Cancelar" --notags \
+        --default-item "$def" --menu "$text" "$UI_H" "$UI_W" "$list" "$@"
+      return ;;
+  esac
   local keys=() i=0 defn=1 ans
   printf '\n%s\n%s\n' "${C_BOLD}$title${C_RESET}" "$text" >&2
   while (( $# )); do
@@ -416,18 +608,30 @@ ui_menu() {  # ui_menu "título" "texto" "clave por defecto" clave1 desc1 [clave
 
 ui_checklist() {  # ui_checklist "título" "texto" clave desc ON|OFF ... → claves separadas por espacios
   local title="$1" text="$2"; shift 2
-  local n=$(($# / 3))
-  if (( USE_TUI )); then
-    local out list
-    ui_dims "$text" $((n + 7))
-    list=$((UI_H - UI_TEXT - 7))
-    if (( list > n )); then list=$n; fi
-    if (( list < 2 )); then list=2; fi
-    out=$(wt --title "$title" --ok-button "Aceptar" --cancel-button "Cancelar" --notags --separate-output \
-      --checklist "$text" "$UI_H" "$UI_W" "$list" "$@") || return 1
-    printf '%s' "$(printf '%s' "$out" | tr '\n' ' ' | sed 's/ *$//')"
-    return 0
-  fi
+  local n=$(($# / 3)) out list
+  case $UI_MODE in
+    gui)
+      local rows=()
+      while (( $# )); do
+        if [[ $3 == ON ]]; then rows+=(TRUE); else rows+=(FALSE); fi
+        rows+=("$1" "$2")
+        shift 3
+      done
+      out=$(zen --list --checklist --title="$title" --text="$text" --width=680 --height="$(gui_list_height "$text" "$n")" \
+        --column="✓" --column="clave" --column="Opción" --hide-column=2 --print-column=2 --hide-header \
+        --separator=" " --ok-label="Aceptar" --cancel-label="Cancelar" "${rows[@]}") || return 1
+      printf '%s' "$out"
+      return 0 ;;
+    tui)
+      ui_dims "$text" $((n + 7))
+      list=$((UI_H - UI_TEXT - 7))
+      if (( list > n )); then list=$n; fi
+      if (( list < 2 )); then list=2; fi
+      out=$(wt --title "$title" --ok-button "Aceptar" --cancel-button "Cancelar" --notags --separate-output \
+        --checklist "$text" "$UI_H" "$UI_W" "$list" "$@") || return 1
+      printf '%s' "$(printf '%s' "$out" | tr '\n' ' ' | sed 's/ *$//')"
+      return 0 ;;
+  esac
   local sel=() def
   printf '\n%s\n%s\n' "${C_BOLD}$title${C_RESET}" "$text" >&2
   while (( $# )); do
@@ -440,6 +644,7 @@ ui_checklist() {  # ui_checklist "título" "texto" clave desc ON|OFF ... → cla
 }
 
 cancelled() {
+  gui_progress_close
   printf '\n' >&2
   warn "Asistente cancelado. No se ha realizado ningún cambio."
   exit 1
@@ -624,7 +829,7 @@ set_docker_cmd() {  # set_docker_cmd [nosudo]
     DOCKER=(docker --context default)
   else
     ensure_sudo
-    DOCKER=(sudo docker --context default)
+    DOCKER=("${SUDO[@]}" docker --context default)
   fi
   return 0
 }
@@ -757,14 +962,15 @@ ensure_sudo() {
   (( SUDO_READY )) && return 0
   if (( DRY_RUN )); then SUDO_READY=1; return 0; fi
   command -v sudo >/dev/null 2>&1 || die "No se encontró 'sudo'. Usa un usuario administrador."
-  if ! sudo -n true 2>/dev/null; then
+  if ! "${SUDO[@]}" -n true 2>/dev/null; then
+    gui_note "Escribe tu contraseña de Ubuntu en la ventana que se ha abierto..."
     printf '\n'
     info "Se necesitan permisos de administrador: escribe la contraseña de TU usuario de Ubuntu."
     info "(Mientras escribes no se ve nada; es normal.)"
-    sudo -v || die "No se pudieron obtener permisos de administrador (sudo). ¿Tu usuario es administrador?"
+    "${SUDO[@]}" -v || die "No se pudieron obtener permisos de administrador (sudo). ¿Tu usuario es administrador?"
   fi
   SUDO_READY=1
-  ( while kill -0 "$$" 2>/dev/null; do sudo -n true 2>/dev/null || true; sleep 45; done ) &
+  ( while kill -0 "$$" 2>/dev/null; do "${SUDO[@]}" -n true 2>/dev/null || true; sleep 45; done ) &
   SUDO_KEEPALIVE_PID=$!
   return 0
 }
@@ -772,7 +978,7 @@ ensure_sudo() {
 apt_update_once() {
   (( APT_UPDATED )) && return 0
   ensure_sudo
-  if ! run "Actualizando la lista de paquetes (apt update)" sudo apt-get update -o DPkg::Lock::Timeout=300; then
+  if ! run "Actualizando la lista de paquetes (apt update)" "${SUDO[@]}" apt-get update -o DPkg::Lock::Timeout=300; then
     warn "apt update ha dado errores (¿algún repositorio roto?). Se intenta continuar."
   fi
   APT_UPDATED=1
@@ -790,7 +996,7 @@ apt_install() {  # apt_install "descripción" paquete...
     return 0
   fi
   apt_update_once
-  run "$desc (${missing[*]})" sudo env DEBIAN_FRONTEND=noninteractive \
+  run "$desc (${missing[*]})" "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive \
     apt-get install -y -o DPkg::Lock::Timeout=300 "${missing[@]}"
 }
 
@@ -944,10 +1150,13 @@ Imagen: $cur_img
 
 wizard_image() {
   local blocked=0 def text args=() entry key desc size
-  ui_info "Comprobando la red (acceso a los registros de imágenes)..."
+  ui_busy_start "Comprobando la red (acceso a los registros de imágenes)..."
   if ! oracle_storage_ok; then blocked=1; fi
-  if (( blocked )); then def="hub-23ai"; else def="oficial-23ai"; fi
-  if [[ -n $IMAGE_KEY ]] && catalog_field "$IMAGE_KEY" 2 >/dev/null; then
+  ui_busy_stop
+  local want="${ORACLE_PREF:-23ai}"
+  if (( blocked )); then def="hub-$want"; else def="oficial-$want"; fi
+  # Sin --oracle, se propone lo elegido en una instalación anterior
+  if [[ -z $ORACLE_PREF && -n $IMAGE_KEY ]] && catalog_field "$IMAGE_KEY" 2 >/dev/null; then
     if ! (( blocked )) || [[ $IMAGE_KEY == hub-* ]]; then def="$IMAGE_KEY"; fi
   fi
   text="Elige la imagen. 23.9 es la última «23ai» (la de las prácticas);
@@ -1114,24 +1323,134 @@ wizard_summary() {
   local restart_txt="sí, con Docker" text
   [[ $RESTART_POLICY == no ]] && restart_txt="no"
   text="Esto es lo que se va a hacer:
-
-  Docker ........... $engine_txt
-  Imagen ........... $image_txt
-  Contenedor ....... $cont_txt
-  Puerto ........... $BIND_ADDR:$HOST_PORT
-  Arranque auto. ... $restart_txt"
-  text+="
-  Usuario .......... $user_txt  (en $PDB_NAME)
-  Herramientas ..... $extras_txt"
-  if (( ${#REMOVE_CONFLICTS[@]} )); then text+="
-  Se desinstala .... ${REMOVE_CONFLICTS[*]}"; fi
+$(sum_line "Docker" "$engine_txt")$(sum_line "Imagen" "$image_txt")$(sum_line "Contenedor" "$cont_txt")$(sum_line "Puerto" "$BIND_ADDR:$HOST_PORT")$(sum_line "Arranque auto." "$restart_txt")$(sum_line "Usuario" "$user_txt (en $PDB_NAME)")$(sum_line "Herramientas" "$extras_txt")"
+  if (( ${#REMOVE_CONFLICTS[@]} )); then text+="$(sum_line "Se desinstala" "${REMOVE_CONFLICTS[*]}")"; fi
   if [[ -n $dl ]]; then text+="
 
 Descargas aproximadas: $dl."; fi
   text+="
 
 ¿Empezamos?"
-  ui_yesno "Resumen" "$text" si
+  UI_YES="Instalar" UI_NO="Cancelar" ui_yesno "Resumen" "$text" si
+}
+
+sum_line() {  # sum_line "etiqueta" "valor" → línea del resumen (empieza con salto de línea)
+  if [[ $UI_MODE == gui ]]; then
+    printf '\n• %s: %s' "$1" "$2"
+  else
+    local dots="................"
+    printf '\n  %s %s %s' "$1" "${dots:0:$((16 - ${#1}))}" "$2"
+  fi
+}
+
+# --- Asistente en modo gráfico: menos ventanas, con varias opciones juntas ----
+wizard_gui() {
+  local text
+  text="Este asistente deja lista Oracle Database Free en tu Ubuntu:
+
+  1. Instala Docker Desktop y lo que necesita (KVM, repositorio oficial).
+  2. Descarga la imagen de Oracle Database Free (23ai o 26ai).
+  3. Crea el contenedor, con los datos en un volumen persistente.
+  4. Pone tus contraseñas y crea tu usuario de trabajo.
+  5. Añade «Oracle Database Free» al menú de aplicaciones.
+
+Necesitarás tu contraseña de Ubuntu y unos 20-40 minutos."
+  if (( ${#PF_WARN[@]} )); then text+=$'\n\nAvisos:\n'"$(printf -- '• %s\n' "${PF_WARN[@]}")"; fi
+  if (( DRY_RUN )); then text+=$'\n\nMODO SIMULACIÓN: solo se mostrará lo que se haría.'; fi
+  UI_YES="Empezar" UI_NO="Salir" ui_yesno "Bienvenida" "$text" si || cancelled
+  wizard_engine
+  wizard_conflicts
+  wizard_container
+  if [[ $EXISTING_ACTION != keep ]]; then
+    wizard_image
+    wizard_port
+  fi
+  wizard_gui_options
+  wizard_gui_passwords
+  wizard_summary || cancelled
+}
+
+wizard_gui_options() {  # una sola lista con todas las opciones de sí/no
+  local items=() sel name problem
+  local o_restart="ON" o_net="OFF" o_dd="OFF" o_sqlcl="OFF" o_sqldev="OFF"
+  [[ $RESTART_POLICY == no ]] && o_restart="OFF"
+  [[ $BIND_ADDR == 0.0.0.0 ]] && o_net="ON"
+  [[ $DD_AUTOSTART == yes ]] && o_dd="ON"
+  [[ " $EXTRAS " == *" sqlcl "* ]] && o_sqlcl="ON"
+  [[ " $EXTRAS " == *" sqldeveloper "* ]] && o_sqldev="ON"
+  items+=(usuario "Crear un usuario de trabajo para las prácticas (recomendado)" ON)
+  if [[ $EXISTING_ACTION != keep ]]; then
+    items+=(autoarranque "Arrancar Oracle automáticamente cuando se inicie Docker" "$o_restart")
+    items+=(red "Permitir conexiones desde otros equipos de la red (no recomendado)" "$o_net")
+  fi
+  if [[ $ENGINE == desktop ]]; then
+    items+=(dd_login "Abrir Docker Desktop al iniciar sesión en Ubuntu" "$o_dd")
+  fi
+  items+=(sqlcl "Instalar SQLcl, la línea de comandos de Oracle (~120 MB + Java 17)" "$o_sqlcl")
+  items+=(sqldeveloper "Instalar SQL Developer 24.3.1, entorno gráfico (~560 MB + JDK 17)" "$o_sqldev")
+  sel=$(ui_checklist "Opciones" "Marca lo que quieras (las marcadas son las recomendadas):" "${items[@]}") || cancelled
+  sel=" $sel "
+  if [[ $EXISTING_ACTION != keep ]]; then
+    if [[ $sel == *" autoarranque "* ]]; then RESTART_POLICY="unless-stopped"; else RESTART_POLICY="no"; fi
+    if [[ $sel == *" red "* ]]; then BIND_ADDR="0.0.0.0"; else BIND_ADDR="127.0.0.1"; fi
+  fi
+  if [[ $ENGINE == desktop ]]; then
+    if [[ $sel == *" dd_login "* ]]; then DD_AUTOSTART="yes"; else DD_AUTOSTART="no"; fi
+  fi
+  EXTRAS=""
+  if [[ $sel == *" sqlcl "* ]]; then EXTRAS="sqlcl"; fi
+  if [[ $sel == *" sqldeveloper "* ]]; then EXTRAS="${EXTRAS:+$EXTRAS }sqldeveloper"; fi
+  if [[ $sel != *" usuario "* ]]; then
+    APP_USER=""
+    return 0
+  fi
+  while true; do
+    name=$(ui_input "Usuario de trabajo" "Nombre de tu usuario de trabajo en $PDB_NAME (letras sin tildes, números y _, empezando por letra):" "${APP_USER:-alumno}") || cancelled
+    if problem=$(user_problem "$name"); then
+      ui_msg "Nombre no válido" "$problem"
+      continue
+    fi
+    break
+  done
+  APP_USER="${name^^}"
+}
+
+wizard_gui_passwords() {  # todas las contraseñas en un solo formulario
+  local out a1 a2 u1 u2 problem fields
+  fields=(--add-password="Contraseña de SYS, SYSTEM y PDBADMIN" --add-password="Repite esa contraseña")
+  if [[ -n $APP_USER ]]; then
+    fields+=(--add-password="Contraseña de $APP_USER (vacía = la misma)" --add-password="Repite la contraseña de $APP_USER")
+  fi
+  while true; do
+    out=$(zen --forms --title="Contraseñas" --width=560 --separator=$'\x1f' \
+      --text="8 a 30 caracteres, empezando por letra, con al menos una mayúscula, una minúscula y un número.
+Solo letras sin tildes, números, _ y #. No se guardan en ningún sitio: apúntalas." \
+      --ok-label="Aceptar" --cancel-label="Cancelar" "${fields[@]}") || cancelled
+    a1="" a2="" u1="" u2=""
+    IFS=$'\x1f' read -r a1 a2 u1 u2 <<<"$out" || true
+    if problem=$(password_problem "$a1"); then
+      ui_msg "Contraseña no válida" "Contraseña de administración: $problem"
+      continue
+    fi
+    if [[ $a1 != "$a2" ]]; then
+      ui_msg "No coinciden" "Las dos contraseñas de administración no coinciden."
+      continue
+    fi
+    if [[ -n $APP_USER ]]; then
+      if [[ -z $u1 && -z $u2 ]]; then
+        u1="$a1"
+      elif problem=$(password_problem "$u1"); then
+        ui_msg "Contraseña no válida" "Contraseña de $APP_USER: $problem"
+        continue
+      elif [[ $u1 != "$u2" ]]; then
+        ui_msg "No coinciden" "Las dos contraseñas de $APP_USER no coinciden."
+        continue
+      fi
+    fi
+    ADMIN_PWD="$a1"
+    APP_PWD="$u1"
+    return 0
+  done
 }
 
 # =============================================================================
@@ -1155,7 +1474,7 @@ setup_kvm() {
     ensure_sudo
     local mod="kvm_intel"
     grep -qw svm /proc/cpuinfo && mod="kvm_amd"
-    run "Cargando los módulos de KVM" sudo modprobe -a kvm "$mod" || true
+    run "Cargando los módulos de KVM" "${SUDO[@]}" modprobe -a kvm "$mod" || true
     if [[ ! -e /dev/kvm ]] && (( ! DRY_RUN )); then
       die "No existe /dev/kvm. Activa la virtualización (Intel VT-x o AMD-V/SVM) en la BIOS/UEFI y vuelve a intentarlo."
     fi
@@ -1166,7 +1485,7 @@ setup_kvm() {
   ok "Virtualización KVM disponible"
   if ! in_group_db kvm; then
     ensure_sudo
-    run "Añadiendo tu usuario al grupo kvm" sudo usermod -aG kvm "$USER" || die "No se pudo añadir tu usuario al grupo kvm."
+    run "Añadiendo tu usuario al grupo kvm" "${SUDO[@]}" usermod -aG kvm "$USER" || die "No se pudo añadir tu usuario al grupo kvm."
   fi
   if [[ -r /dev/kvm && -w /dev/kvm ]] || (( DRY_RUN )); then
     ok "Tu usuario tiene acceso a /dev/kvm"
@@ -1180,7 +1499,7 @@ remove_conflicts() {
   (( ${#REMOVE_CONFLICTS[@]} )) || return 0
   ensure_sudo
   run "Desinstalando paquetes de Docker no oficiales (${REMOVE_CONFLICTS[*]})" \
-    sudo env DEBIAN_FRONTEND=noninteractive apt-get remove -y -o DPkg::Lock::Timeout=300 "${REMOVE_CONFLICTS[@]}" \
+    "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get remove -y -o DPkg::Lock::Timeout=300 "${REMOVE_CONFLICTS[@]}" \
     || die "No se pudieron desinstalar los paquetes en conflicto."
 }
 
@@ -1209,9 +1528,9 @@ setup_docker_repo() {
   fi
   printf 'Types: deb\nURIs: %s\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' \
     "$DOCKER_REPO_URL" "$OS_CODENAME" "$ARCH" >"$src"
-  run "Instalando la clave en /etc/apt/keyrings/docker.asc" sudo install -D -m 0644 "$key" /etc/apt/keyrings/docker.asc \
+  run "Instalando la clave en /etc/apt/keyrings/docker.asc" "${SUDO[@]}" install -D -m 0644 "$key" /etc/apt/keyrings/docker.asc \
     || die "No se pudo instalar la clave de Docker."
-  run "Añadiendo el repositorio oficial de Docker" sudo install -m 0644 "$src" /etc/apt/sources.list.d/docker.sources \
+  run "Añadiendo el repositorio oficial de Docker" "${SUDO[@]}" install -m 0644 "$src" /etc/apt/sources.list.d/docker.sources \
     || die "No se pudo añadir el repositorio de Docker."
   APT_UPDATED=0
   apt_update_once
@@ -1251,7 +1570,7 @@ install_docker_desktop() {
   chmod 644 "$deb" 2>/dev/null || true
   ensure_sudo
   apt_update_once
-  run "Instalando Docker Desktop (puede tardar varios minutos)" sudo env DEBIAN_FRONTEND=noninteractive \
+  run "Instalando Docker Desktop (puede tardar varios minutos)" "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive \
     apt-get install -y -o DPkg::Lock::Timeout=300 "$deb" || die "No se pudo instalar Docker Desktop."
 }
 
@@ -1281,6 +1600,13 @@ relogin_exit() {
   printf '%s\n' "Después, vuelve a ejecutar:"
   printf '\n    %s\n\n' "${C_BOLD}$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo ./oracle23ai.sh) instalar${C_RESET}"
   printf '%s\n' "Se recordarán tus respuestas (salvo las contraseñas) y se continuará donde lo dejaste."
+  if [[ $UI_MODE == gui ]]; then
+    gui_progress_close
+    ui_msg "Hace falta cerrar sesión" "Tu usuario se ha añadido al grupo «kvm», pero la sesión actual todavía no lo sabe, así que Docker Desktop no podría arrancar.
+
+1. Cierra sesión en Ubuntu y vuelve a entrar (o reinicia).
+2. Vuelve a abrir el instalador: recordará tus respuestas (salvo las contraseñas) y seguirá donde lo dejó."
+  fi
   exit 0
 }
 
@@ -1302,8 +1628,22 @@ start_docker_desktop() {
     if command -v notify-send >/dev/null 2>&1 && (( ! DRY_RUN )); then
       notify-send "Instalador Oracle 23ai" "Acepta el acuerdo de Docker Desktop para continuar" 2>/dev/null || true
     fi
+    if [[ $UI_MODE == gui ]] && (( ! DRY_RUN )); then
+      zen --info --title="Acción necesaria en Docker Desktop" --no-markup --width=540 --ok-label="Entendido" \
+        --text="Se está abriendo Docker Desktop.
+
+1. La primera vez aparece el «Docker Subscription Service Agreement»: léelo y pulsa «Accept» (es gratuito para uso personal y educativo).
+2. Puedes saltarte el inicio de sesión y la encuesta («Skip»).
+
+La instalación seguirá sola en cuanto Docker Desktop esté listo (esta ventana se cerrará sola)." &
+      GUI_INFO_PID=$!
+    fi
     wait_for "Esperando a que Docker Desktop esté listo" 1200 docker_desktop_ready \
       || die "Docker Desktop no ha arrancado en 20 minutos. Ábrelo desde el menú de aplicaciones, revisa si muestra algún error y vuelve a ejecutar '$APP_CMD instalar'. Registros de Docker Desktop: ~/.docker/desktop/log/"
+    if [[ -n $GUI_INFO_PID ]]; then
+      kill "$GUI_INFO_PID" 2>/dev/null || true
+      GUI_INFO_PID=""
+    fi
   fi
   if (( ! DRY_RUN )); then
     docker context use desktop-linux >>"$LOG_FILE" 2>&1 || true
@@ -1342,17 +1682,38 @@ Cómo aumentarla:
 start_docker_engine() {
   if ! systemctl is-active --quiet docker 2>/dev/null; then
     ensure_sudo
-    run "Arrancando el servicio de Docker" sudo systemctl enable --now docker.service || die "No se pudo arrancar Docker."
+    run "Arrancando el servicio de Docker" "${SUDO[@]}" systemctl enable --now docker.service || die "No se pudo arrancar Docker."
   else
     ok "El servicio de Docker está en marcha"
   fi
   if ! in_group_db docker; then
     ensure_sudo
-    run "Añadiendo tu usuario al grupo docker" sudo usermod -aG docker "$USER" || true
+    run "Añadiendo tu usuario al grupo docker" "${SUDO[@]}" usermod -aG docker "$USER" || true
     DOCKER_GROUP_ADDED=1
   fi
   set_docker_cmd
   wait_for "Comprobando que Docker responde" 120 docker_ready || die "Docker no responde. Prueba: sudo systemctl status docker"
+}
+
+pull_progress() {  # resume la salida de «docker pull» en la ventana de progreso
+  local line id start=$SECONDS
+  local -A seen=() finished=()
+  while IFS= read -r line; do
+    printf '%s\n' "$line" >>"${LOG_FILE:-/dev/null}"
+    if [[ $line =~ ^([0-9a-f]{12}):\ (.*)$ ]]; then
+      id="${BASH_REMATCH[1]}"
+      seen[$id]=1
+      case ${BASH_REMATCH[2]} in
+        "Pull complete"* | "Already exists"*) finished[$id]=1 ;;
+      esac
+    fi
+    if (( ${#seen[@]} )); then
+      gui_note "Descargando la imagen: ${#finished[@]} de ${#seen[@]} partes listas ($(fmt_time $((SECONDS - start))))"
+    else
+      gui_note "Descargando la imagen ($(fmt_time $((SECONDS - start))))"
+    fi
+  done
+  return 0
 }
 
 docker_pull() {  # docker_pull imagen → 0 si se descarga
@@ -1362,7 +1723,11 @@ docker_pull() {  # docker_pull imagen → 0 si se descarga
     return 0
   fi
   log "PULL $img"
-  if "${DOCKER[@]}" pull "$img" 2>"$errf"; then return 0; fi
+  if [[ $UI_MODE == gui ]]; then
+    if "${DOCKER[@]}" pull "$img" 2>"$errf" | pull_progress; then return 0; fi
+  elif "${DOCKER[@]}" pull "$img" 2>"$errf"; then
+    return 0
+  fi
   cat "$errf" >&2
   cat "$errf" >>"$LOG_FILE"
   # Docker Desktop sin «pass» inicializado puede fallar al consultar credenciales:
@@ -1459,8 +1824,9 @@ wait_db() {  # wait_db nueva|reinicio → espera a que la base de datos esté li
       print_container_logs 30
       return 1
     fi
+    last=$(printf '%s\n' "$logs" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-45) || last=""
+    gui_note "Preparando Oracle... $(fmt_time $((SECONDS - start))) · ${last}"
     if [[ -t 1 ]]; then
-      last=$(printf '%s\n' "$logs" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-45) || last=""
       printf '\r\e[K %s Preparando Oracle... %s  %s' "${C_CYAN}${frames:i++%4:1}${C_RESET}" \
         "$(fmt_time $((SECONDS - start)))" "${C_DIM}${last}${C_RESET}"
     fi
@@ -1673,6 +2039,42 @@ install_helper() {
   return 0
 }
 
+write_icon() {  # icono propio: base de datos blanca sobre fondo rojo
+  cat >"$1" <<'SVG'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect x="8" y="8" width="112" height="112" rx="26" fill="#c74634"/>
+  <g fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round">
+    <ellipse cx="64" cy="38" rx="31" ry="11"/>
+    <path d="M33 38v52c0 6 14 11 31 11s31-5 31-11V38"/>
+    <path d="M33 64c0 6 14 11 31 11s31-5 31-11"/>
+  </g>
+</svg>
+SVG
+}
+
+install_desktop_entry() {  # acceso «Oracle Database Free» en el menú de aplicaciones
+  [[ -n ${XDG_CURRENT_DESKTOP:-}${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] || return 0
+  if (( DRY_RUN )); then
+    printf '%s crear el acceso «Oracle Database Free» en el menú de aplicaciones\n' "${C_DIM}[simulación]${C_RESET}"
+    return 0
+  fi
+  mkdir -p "$DATA_DIR" "$APPS_DIR"
+  write_icon "$DATA_DIR/oracle23ai.svg"
+  cat >"$APPS_DIR/oracle23ai.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Oracle Database Free
+GenericName=Base de datos Oracle
+Comment=Arranca, detén y conéctate a tu base de datos Oracle (instalado con oracle23ai.sh)
+Exec="$BIN_DIR/$APP_CMD" --gui
+Icon=$DATA_DIR/oracle23ai.svg
+Terminal=false
+Categories=Development;Database;
+Keywords=oracle;sql;database;base de datos;
+EOF
+  ok "Acceso «Oracle Database Free» añadido al menú de aplicaciones"
+}
+
 save_config() {
   if (( DRY_RUN )); then
     printf '%s guardar la configuración (sin contraseñas) en %s\n' "${C_DIM}[simulación]${C_RESET}" "$CONFIG_FILE"
@@ -1751,6 +2153,12 @@ write_info_file() {
 show_final_summary() {
   if (( DRY_RUN )); then
     printf '\n%s\n' "${C_BOLD}Simulación terminada: no se ha cambiado nada.${C_RESET}"
+    if [[ $UI_MODE == gui ]]; then
+      gui_progress_close
+      ui_msg "Simulación terminada" "No se ha cambiado nada. Con una instalación real, estos serían tus datos:
+
+$(connection_text)"
+    fi
     return 0
   fi
   printf '\n%s\n' "${C_GREEN}${C_BOLD}$S_RULE${C_RESET}"
@@ -1768,6 +2176,17 @@ show_final_summary() {
   fi
   info "Datos de conexión guardados en: $INFO_FILE"
   info "Registro de la instalación: $LOG_FILE"
+  if [[ $UI_MODE == gui ]]; then
+    gui_progress_close
+    local btn args=(--info --title="Oracle Database Free está listo" --no-markup --width=660 --ok-label="Cerrar")
+    [[ -z ${GUI_IN_PANEL:-} ]] && args+=(--extra-button="Abrir el panel")
+    btn=$(zen "${args[@]}" --text="$(connection_text)
+
+Las contraseñas no se guardan en ningún sitio: apúntalas. Si olvidas una, usa «Cambiar o desbloquear contraseñas» en el panel.
+Busca «Oracle Database Free» en el menú de aplicaciones para arrancar, detener o conectarte.") || true
+    if [[ $btn == "Abrir el panel" ]]; then gui_panel; fi
+  fi
+  return 0
 }
 
 install_run() {
@@ -1796,6 +2215,7 @@ install_run() {
   step "Herramientas y comando '$APP_CMD'"
   install_extras
   install_helper
+  install_desktop_entry
   INSTALL_STAGE="completo"
   INSTALLED_AT=$(date '+%F %H:%M')
   save_config
@@ -1811,25 +2231,33 @@ cmd_install() {
   ui_init
   load_config || true
   preflight_collect
-  local m
+  local m msg
   for m in "${PF_OK[@]}"; do log "OK    $m"; done
   if (( ${#PF_ERR[@]} )); then
     for m in "${PF_WARN[@]}"; do warn "$m"; done
     for m in "${PF_ERR[@]}"; do err "$m"; done
-    ui_msg "No se puede instalar" "$(printf -- '- %s\n' "${PF_ERR[@]}")"
-    die "Corrige los problemas anteriores y vuelve a ejecutar '$0 instalar'."
-  fi
-  if (( ${#PF_WARN[@]} )); then
-    for m in "${PF_WARN[@]}"; do warn "$m"; done
-    ui_yesno "Avisos" "Se han encontrado estos avisos:
-
-$(printf -- '- %s\n\n' "${PF_WARN[@]}")¿Quieres continuar?" si || cancelled
+    msg="No se puede instalar en este equipo:
+$(printf -- '- %s\n' "${PF_ERR[@]}")"
+    [[ $UI_MODE == gui ]] || ui_msg "No se puede instalar" "$msg"
+    die "$msg
+Corrige los problemas y vuelve a ejecutar '$0 instalar'."
   fi
   [[ $INSTALL_STAGE == relogin ]] && info "Continuando la instalación que quedó pendiente de cerrar sesión."
-  wizard
-  [[ -t 1 ]] && clear
+  if [[ $UI_MODE == gui ]]; then
+    wizard_gui
+  else
+    if (( ${#PF_WARN[@]} )); then
+      for m in "${PF_WARN[@]}"; do warn "$m"; done
+      ui_yesno "Avisos" "Se han encontrado estos avisos:
+
+$(printf -- '- %s\n\n' "${PF_WARN[@]}")¿Quieres continuar?" si || cancelled
+    fi
+    wizard
+    [[ -t 1 ]] && clear
+  fi
   printf '%s\n' "${C_BOLD}$APP_NAME · v$APP_VERSION${C_RESET}"
   info "Registro detallado: $LOG_FILE"
+  gui_progress_open "Preparando la instalación..."
   install_run
 }
 
@@ -1841,7 +2269,7 @@ ensure_docker_running() {
       || die "Docker Desktop no arranca. Ábrelo desde el menú de aplicaciones y revisa si muestra algún error."
   else
     ensure_sudo
-    run "Arrancando el servicio de Docker" sudo systemctl start docker.service || die "No se pudo arrancar Docker."
+    run "Arrancando el servicio de Docker" "${SUDO[@]}" systemctl start docker.service || die "No se pudo arrancar Docker."
     set_docker_cmd
     wait_for "Esperando a Docker" 120 docker_ready || die "Docker no responde. Prueba: sudo systemctl status docker"
   fi
@@ -1871,6 +2299,12 @@ cmd_start() {
 cmd_stop() {
   require_config
   init_log oracle23ai anexar
+  # Se pregunta antes de detener nada (el panel gráfico ya lo pregunta él mismo)
+  if [[ $ENGINE == desktop ]] && (( ! STOP_ALL )) && [[ -z ${STOP_ASKED:-} ]] \
+    && { [[ $UI_MODE == gui ]] || [[ -t 0 && -t 1 ]]; }; then
+    ui_init
+    if ui_yesno "Cerrar Docker Desktop" "¿Cerrar también Docker Desktop para liberar memoria?" no; then STOP_ALL=1; fi
+  fi
   if ! docker_ready; then
     ok "Docker no está en marcha: Oracle ya está detenido."
     return 0
@@ -1881,14 +2315,8 @@ cmd_stop() {
   else
     ok "Oracle ya estaba detenido."
   fi
-  if [[ $ENGINE == desktop ]]; then
-    if (( ! STOP_ALL )) && [[ -t 0 && -t 1 ]]; then
-      ui_init
-      if ui_yesno "Cerrar Docker Desktop" "¿Cerrar también Docker Desktop para liberar memoria?" no; then STOP_ALL=1; fi
-    fi
-    if (( STOP_ALL )); then
-      run "Cerrando Docker Desktop" systemctl --user stop docker-desktop || true
-    fi
+  if [[ $ENGINE == desktop ]] && (( STOP_ALL )); then
+    run "Cerrando Docker Desktop" systemctl --user stop docker-desktop || true
   fi
 }
 
@@ -1988,6 +2416,7 @@ cmd_password() {
     admin)
       pwd=$(ask_new_password "SYS, SYSTEM y PDBADMIN") || exit 1
       { admin_sql "$pwd"; printf 'EXIT SUCCESS\n'; } | run_sql_script "Contraseña de administración cambiada" || exit 1
+      ui_done "Contraseña de SYS, SYSTEM y PDBADMIN cambiada."
       ;;
     app|otro)
       if [[ $target == app ]]; then
@@ -2002,6 +2431,7 @@ cmd_password() {
       fi
       pwd=$(ask_new_password "el usuario $user") || exit 1
       { alter_user_sql "$user" "$pwd"; printf 'EXIT SUCCESS\n'; } | run_sql_script "Contraseña de $user cambiada (y cuenta desbloqueada)" || exit 1
+      ui_done "Contraseña de $user cambiada (y cuenta desbloqueada)."
       ;;
   esac
 }
@@ -2023,6 +2453,8 @@ cmd_create_user() {
     | run_sql_script "Usuario $user creado en $PDB_NAME (rol DB_DEVELOPER_ROLE)" || exit 1
   if verify_login "$user" "$pwd"; then ok "Conexión comprobada: $user@$PDB_NAME"; fi
   info "Conéctate con: $APP_CMD sql $user"
+  ui_done "Usuario $user creado en $PDB_NAME (rol DB_DEVELOPER_ROLE).
+Conéctate con: $APP_CMD sql $user"
 }
 
 cmd_check() {
@@ -2082,7 +2514,7 @@ cmd_uninstall() {
   if [[ $ENGINE == desktop ]] && pkg_installed docker-desktop; then
     items+=(docker "Docker Desktop entero (con TODOS sus contenedores e imágenes)" OFF)
   fi
-  items+=(comando "El comando '$APP_CMD', su configuración y sus registros" ON)
+  items+=(comando "El comando '$APP_CMD', su acceso en el menú, su configuración y sus registros" ON)
   choice=$(ui_checklist "Desinstalar" "Marca lo que quieres eliminar (barra espaciadora para marcar):" "${items[@]}") || exit 0
   if [[ -z $choice ]]; then
     info "No se ha marcado nada: no se elimina nada."
@@ -2115,9 +2547,9 @@ Escribe BORRAR para confirmar:" "") || exit 1
     ensure_sudo
     run "Cerrando Docker Desktop" systemctl --user stop docker-desktop || true
     run "Desactivando su inicio automático" systemctl --user disable docker-desktop || true
-    run "Desinstalando Docker Desktop" sudo env DEBIAN_FRONTEND=noninteractive apt-get purge -y docker-desktop || true
+    run "Desinstalando Docker Desktop" "${SUDO[@]}" env DEBIAN_FRONTEND=noninteractive apt-get purge -y docker-desktop || true
     run "Borrando la máquina virtual de Docker Desktop" rm -rf -- "$HOME/.docker/desktop" || true
-    run "Borrando /usr/local/bin/com.docker.cli" sudo rm -f /usr/local/bin/com.docker.cli || true
+    run "Borrando /usr/local/bin/com.docker.cli" "${SUDO[@]}" rm -f /usr/local/bin/com.docker.cli || true
     if [[ -f $HOME/.docker/config.json ]] && command -v python3 >/dev/null 2>&1; then
       run "Limpiando ~/.docker/config.json" python3 - "$HOME/.docker/config.json" <<'PY' || true
 import json, sys
@@ -2142,11 +2574,13 @@ PY
     local log_copy="${TMPDIR:-/tmp}/oracle23ai-desinstalacion.log"
     [[ -n $LOG_FILE && -f $LOG_FILE ]] && cp "$LOG_FILE" "$log_copy" 2>/dev/null
     LOG_FILE=""
-    run "Eliminando el comando '$APP_CMD', su configuración y registros" \
-      rm -rf -- "$BIN_DIR/$APP_CMD" "$CONFIG_DIR" "$STATE_DIR" || true
+    run "Eliminando el comando '$APP_CMD', su acceso en el menú, su configuración y registros" \
+      rm -rf -- "$BIN_DIR/$APP_CMD" "$APPS_DIR/oracle23ai.desktop" "$DATA_DIR/oracle23ai.svg" \
+      "$CONFIG_DIR" "$STATE_DIR" || true
     [[ -f $log_copy ]] && info "Copia del registro de esta desinstalación: $log_copy"
   fi
   ok "Desinstalación terminada."
+  ui_done "Desinstalación terminada."
 }
 
 cmd_help() {
@@ -2173,15 +2607,125 @@ ${C_BOLD}Uso diario${C_RESET}
   logs               Registro del contenedor (Ctrl+C para salir)
 
 ${C_BOLD}Opciones${C_RESET}
+  --gui              Ventanas gráficas (lo normal si hay escritorio)
+  --tui              Ventanas dentro de la terminal
+  --texto            Preguntas en texto plano, sin ventanas (también --sin-tui)
+  --oracle 26ai      Propone la versión 26ai en lugar de 23ai
   --simular          Muestra lo que haría sin cambiar nada
-  --sin-tui          Preguntas en texto plano, sin ventanas
   -h, --ayuda        Esta ayuda
   -V, --version      Versión
 EOF
 }
 
+# --- Panel gráfico de uso diario (lo abre el acceso del menú de aplicaciones) --
+gui_status_line() {
+  local state
+  if [[ $INSTALL_STAGE != completo ]]; then
+    printf 'Oracle Database Free todavía no está instalado en este equipo.'
+    return 0
+  fi
+  if ! docker_ready; then
+    printf 'Docker está detenido. Pulsa «Arrancar Oracle» para ponerlo todo en marcha.'
+    return 0
+  fi
+  state=$(container_state)
+  case $state in
+    running)
+      if db_sql_ready; then
+        printf '✔ Oracle está en marcha · localhost:%s · servicio %s' "$HOST_PORT" "$PDB_NAME"
+      else
+        printf '… Oracle está arrancando: espera un momento.'
+      fi ;;
+    "") printf 'No existe el contenedor %s: usa «Reinstalar o reparar».' "$CONTAINER_NAME" ;;
+    *) printf '■ Oracle está detenido.' ;;
+  esac
+}
+
+gui_panel() {
+  local choice status
+  export GUI_IN_PANEL=1
+  while true; do
+    INSTALL_STAGE=""
+    load_config || true
+    [[ -n $ENGINE ]] || ENGINE="desktop"
+    set_docker_cmd nosudo
+    status=$(gui_status_line 2>/dev/null) || status=""
+    if [[ $INSTALL_STAGE == completo ]]; then
+      choice=$(zen --list --title="Oracle Database Free" --text="$status" --width=560 --height=620 \
+        --column="id" --column="Acción" --hide-column=1 --print-column=1 --hide-header \
+        --ok-label="Abrir" --cancel-label="Salir" \
+        iniciar "▶  Arrancar Oracle" \
+        parar "■  Detener Oracle" \
+        sql "⌨  SQL*Plus con tu usuario" \
+        sysdba "⌨  SQL*Plus como SYSDBA (administración)" \
+        info "ℹ  Datos de conexión" \
+        estado "◉  Estado detallado" \
+        password "🔑  Cambiar o desbloquear contraseñas" \
+        crear-usuario "👤  Crear otro usuario" \
+        logs "📜  Registro de Oracle" \
+        comprobar "🩺  Diagnóstico del sistema" \
+        instalar "⟳  Reinstalar o reparar" \
+        desinstalar "🗑  Desinstalar") || return 0
+    else
+      choice=$(zen --list --title="$APP_NAME" --text="$status" --width=560 --height=360 \
+        --column="id" --column="Acción" --hide-column=1 --print-column=1 --hide-header \
+        --ok-label="Abrir" --cancel-label="Salir" \
+        instalar "⬇  Instalar Oracle Database Free" \
+        comprobar "🩺  Comprobar requisitos y red") || return 0
+    fi
+    if [[ -n $choice ]]; then gui_action "$choice" || true; fi
+  done
+}
+
+gui_action() {  # cada acción va en un subproceso: si falla, el panel sigue abierto
+  local out rc=0 title
+  case $1 in
+    estado|info|comprobar)
+      case $1 in
+        estado) title="Estado de Oracle" ;;
+        info) title="Datos de conexión" ;;
+        *) title="Diagnóstico del sistema" ;;
+      esac
+      gui_progress_open "Consultando..." pulsate
+      out=$( (GUI_QUIET_ERRORS=1 dispatch "$1") 2>&1 ) || rc=$?
+      gui_progress_close
+      gui_show_text "$title" "$(strip_ansi <<<"$out")"
+      ;;
+    iniciar|parar)
+      if [[ $1 == parar && $ENGINE == desktop ]]; then
+        STOP_ALL=0
+        if ui_yesno "Detener Oracle" "¿Cerrar también Docker Desktop para liberar memoria?" no; then STOP_ALL=1; fi
+        export STOP_ASKED=1
+      fi
+      if [[ $1 == iniciar ]]; then
+        gui_progress_open "Arrancando Oracle (y Docker si hace falta)..." pulsate
+      else
+        gui_progress_open "Deteniendo Oracle de forma ordenada (hasta 2 minutos)..." pulsate
+      fi
+      out=$( (GUI_QUIET_ERRORS=1 dispatch "$1") 2>&1 ) || rc=$?
+      gui_progress_close
+      if (( rc != 0 )); then
+        gui_show_text "No se pudo completar" "$(strip_ansi <<<"$out")"
+      elif [[ $1 == iniciar ]]; then
+        ui_msg "Oracle está en marcha" "$(connection_text)"
+      else
+        ui_msg "Oracle detenido" "Oracle se ha detenido correctamente."
+      fi
+      ;;
+    sql) open_in_terminal "SQL*Plus · Oracle" sql ;;
+    sysdba) open_in_terminal "SQL*Plus SYSDBA · Oracle" sysdba ;;
+    logs) open_in_terminal "Registro de Oracle" logs ;;
+    *) (dispatch "$1") || true ;;
+  esac
+  return 0
+}
+
 cmd_menu() {
   ui_init
+  if [[ $UI_MODE == gui ]]; then
+    gui_panel
+    return 0
+  fi
   local choice installed=0
   if load_config && [[ $INSTALL_STAGE == completo ]]; then installed=1; fi
   if (( installed )); then
@@ -2210,7 +2754,7 @@ cmd_menu() {
       salir "Salir") || exit 0
   fi
   [[ $choice == salir ]] && exit 0
-  [[ -t 1 && $USE_TUI == 1 ]] && clear
+  [[ -t 1 && $UI_MODE == tui ]] && clear
   dispatch "$choice"
 }
 
@@ -2242,8 +2786,16 @@ main() {
   while (( $# )); do
     case $1 in
       --simular|--dry-run) DRY_RUN=1 ;;
-      --sin-tui|--no-tui|--texto) USE_TUI=0 ;;
+      --gui|--grafico) UI_MODE="gui" ;;
+      --tui|--terminal) UI_MODE="tui" ;;
+      --sin-tui|--no-tui|--texto) UI_MODE="texto" ;;
       --todo|--all) STOP_ALL=1 ;;
+      --oracle=*) ORACLE_PREF="${1#*=}" ;;
+      --oracle)
+        [[ $# -ge 2 ]] || die "Falta la versión después de --oracle (23ai o 26ai)."
+        ORACLE_PREF="$2"
+        shift
+        ;;
       -h|--help|--ayuda) cmd="ayuda" ;;
       -V|--version) printf '%s %s\n' "$APP_CMD" "$APP_VERSION"; exit 0 ;;
       -*) die "Opción desconocida: $1 (usa '$APP_CMD ayuda')" ;;
@@ -2251,6 +2803,9 @@ main() {
     esac
     shift
   done
+  if [[ -n $ORACLE_PREF && ! $ORACLE_PREF =~ ^(23ai|26ai)$ ]]; then
+    die "Versión no válida en --oracle: «$ORACLE_PREF». Usa 23ai o 26ai."
+  fi
   if (( EUID == 0 )); then
     die "No ejecutes esta herramienta como root ni con sudo: usa tu usuario normal (./oracle23ai.sh). Pedirá la contraseña cuando haga falta."
   fi

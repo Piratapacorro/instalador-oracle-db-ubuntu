@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  zenity falso para probar el modo gráfico sin escritorio (pruebas y CI).
+#
+#  Simula a alguien que pulsa Enter en cada ventana (acepta lo propuesto), salvo
+#  en las ventanas que coinciden con una respuesta programada en $ZENITY_RESPUESTAS:
+#     patrón (regex sobre «tipo título texto») <TAB> código de salida <TAB> salida
+#  (la salida se escribe con printf %b, así que admite \x1f, \n...).
+#
+#  Cada ventana se anota en $ZENITY_LOG («DIALOGO tipo título texto»), igual que
+#  las líneas que recibe una ventana de progreso («PROGRESO línea»). Si recibe una
+#  opción que zenity 4 no tiene, lo anota como OPCION_DESCONOCIDA y falla.
+# =============================================================================
+set -u
+log="${ZENITY_LOG:-/dev/null}"
+permitidas=" --title --width --height --timeout --ok-label --cancel-label --extra-button --modal
+ --info --error --warning --question --entry --password --list --forms --progress --text-info
+ --notification --text --icon --no-wrap --no-markup --default-cancel --ellipsize --switch
+ --entry-text --hide-text --username --column --checklist --radiolist --imagelist --separator
+ --multiple --editable --print-column --hide-column --hide-header --add-entry --add-password
+ --add-calendar --add-list --list-values --column-values --add-combo --combo-values --show-header
+ --forms-date-format --percentage --pulsate --auto-close --auto-kill --no-cancel --time-remaining
+ --filename --font --checkbox --auto-scroll "
+permitidas="${permitidas//$'\n'/ }"
+
+tipo="" titulo="" texto="" entrada="" cancelar_por_defecto=0 columna=1 sep="|" ncols=0 marcable=0
+filas=()
+for a in "$@"; do
+  case $a in
+    --*)
+      nombre="${a%%=*}"
+      if [[ $permitidas != *" $nombre "* ]]; then
+        printf 'OPCION_DESCONOCIDA\t%s\n' "$nombre" >>"$log"
+        exit 255
+      fi
+      case $nombre in
+        --info | --error | --warning | --question | --entry | --password | --list | --forms | --progress | --text-info)
+          tipo="${nombre#--}" ;;
+        --title) titulo="${a#*=}" ;;
+        --text) texto="${a#*=}" ;;
+        --entry-text) entrada="${a#*=}" ;;
+        --default-cancel) cancelar_por_defecto=1 ;;
+        --print-column) columna="${a#*=}" ;;
+        --separator) sep="${a#*=}" ;;
+        --column) ncols=$((ncols + 1)) ;;
+        --radiolist | --checklist) marcable=1 ;;
+      esac
+      ;;
+    *) filas+=("$a") ;;
+  esac
+done
+printf 'DIALOGO\t%s\t%s\t%s\n' "$tipo" "$titulo" "${texto//$'\n'/ }" >>"$log"
+
+# Respuesta programada (cada línea se usa una sola vez, en orden)
+if [[ -n ${ZENITY_RESPUESTAS:-} && -f $ZENITY_RESPUESTAS ]]; then
+  usadas="$ZENITY_RESPUESTAS.usadas"
+  touch "$usadas"
+  n=0
+  while IFS=$'\t' read -r patron codigo salida; do
+    n=$((n + 1))
+    [[ -n $patron ]] || continue
+    grep -qx "$n" "$usadas" && continue
+    if [[ "$tipo $titulo $texto" =~ $patron ]]; then
+      echo "$n" >>"$usadas"
+      printf 'RESPUESTA\t%s\n' "$n" >>"$log"
+      [[ -n $salida ]] && printf '%b\n' "$salida"
+      exit "$codigo"
+    fi
+  done <"$ZENITY_RESPUESTAS"
+fi
+
+# Comportamiento por defecto: pulsar Enter
+case $tipo in
+  progress)
+    while IFS= read -r l; do printf 'PROGRESO\t%s\n' "$l" >>"$log"; done
+    exit 0 ;;
+  text-info)
+    [[ -t 0 ]] || cat >/dev/null
+    exit 0 ;;
+  question)
+    exit "$cancelar_por_defecto" ;;
+  entry)
+    printf '%s\n' "$entrada"
+    exit 0 ;;
+  list)
+    (( ncols > 0 )) || exit 0
+    elegidas=()
+    for ((i = 0; i + ncols <= ${#filas[@]}; i += ncols)); do
+      if (( marcable )); then
+        [[ ${filas[i]} == TRUE ]] || continue
+      elif (( ${#elegidas[@]} )); then
+        break   # en una lista simple, Enter elige la primera fila
+      fi
+      elegidas+=("${filas[i + columna - 1]}")
+    done
+    salida=""
+    for e in "${elegidas[@]}"; do salida+="${salida:+$sep}$e"; done
+    printf '%s\n' "$salida"
+    exit 0 ;;
+  forms)
+    printf '\n'
+    exit 0 ;;
+  *)
+    exit 0 ;;
+esac
