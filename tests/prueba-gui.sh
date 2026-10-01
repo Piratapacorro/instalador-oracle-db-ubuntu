@@ -9,6 +9,12 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/home"
 install -m 755 "$raiz/tests/zenity-falso" "$tmp/bin/zenity"
+# df falso con espacio de sobra: la prueba no debe depender del disco de la máquina
+# (las máquinas de GitHub Actions a veces tienen menos de los 15 GB que exige el instalador)
+printf '%s\n' '#!/bin/sh' \
+  'echo "Filesystem 1024-blocks Used Available Capacity Mounted on"' \
+  'echo "/dev/falso 1048576000 0 1048576000 0% /"' >"$tmp/bin/df"
+chmod 755 "$tmp/bin/df"
 fallos=0
 
 si() {  # si "descripción" patrón fichero
