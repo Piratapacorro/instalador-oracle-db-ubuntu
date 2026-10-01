@@ -16,8 +16,8 @@
     "secrets": "Nunca en disco/argv/env: la imagen arranca con contraseña aleatoria y se cambia con SQL por stdin (sqlplus / as sysdba).",
     "readiness": "Base nueva: esperar 'DATABASE IS READY TO USE!' en docker logs --since; reinicio: v$pdbs READ WRITE.",
     "docker_cmd": "desktop -> docker --context desktop-linux; engine -> docker --context default (o sudo docker).",
-    "config": "~/.config/oracle23ai/config (clave=valor, lista blanca, sin contraseñas)",
-    "logs": "~/.local/state/oracle23ai/",
+    "config": "~/.config/oracle-db/config (clave=valor, lista blanca, sin contraseñas)",
+    "logs": "~/.local/state/oracle-db/",
     "network_block": "Si objectstorage.*.oraclecloud.com resuelve a IP privada o no conecta, se propone Docker Hub.",
     "profiles": "image_profile(imagen, clave) fija CDB/PDB/servicio/ruta/rol/login/memoria; se llama al cargar la config y al elegir imagen.",
     "enterprise_login": "docker login --password-stdin con DOCKER_CONFIG temporal; se borra tras el pull."
@@ -41,13 +41,15 @@
     "sqldeveloper"
   ],
   "next_steps": [
+    "Preguntar al usuario si el repositorio debe volver a ser público (los compañeros reciben 404)",
     "Probar Enterprise/Standard con cuenta de Oracle",
     "Probar imagen oficial en red sin bloqueo"
   ],
   "repository": "https://github.com/Piratapacorro/instalador-oracle-db-ubuntu",
   "ci": {
     "workflow": ".github/workflows/comprobaciones.yml",
-    "status": "success"
+    "status": "success",
+    "commit": "b555eb6"
   },
   "ui_modes": {
     "gui": "zenity 4 (por defecto con escritorio)",
@@ -72,5 +74,6 @@
     "21c-ee",
     "otra (cualquier etiqueta)"
   ],
-  "legacy": "v1.x se llamaba oracle23ai (comando, rutas y .desktop); migrate_legacy lo pasa a oracle-db"
+  "legacy": "v1.x se llamaba oracle23ai (comando, rutas y .desktop); migrate_legacy lo pasa a oracle-db",
+  "repository_visibility": "PRIVADO (detectado el 2026-10-01). Se creó público el 2026-09-24 con `gh repo create --public`; ningún comando del agente lo cambió. No cambiarlo sin permiso explícito del usuario."
 }

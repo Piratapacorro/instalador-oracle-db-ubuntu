@@ -75,3 +75,20 @@
   permisos, CRUD, crear-usuario, password, desinstalar. Limpieza: 0 imágenes/contenedores/volúmenes.
 - Fallo encontrado en real y corregido: en 11g el usuario quedaba en el tablespace SYSTEM.
 - Migración real en el equipo del usuario: `oracle-db estado` gestiona su contenedor `oracle26ai`.
+
+## 2026-10-01 — Verificación tras publicar v2.0.0
+
+### Comandos
+- `gh run list` / `gh run view` → CI «Comprobaciones» en verde para `b555eb6` (todos los pasos).
+- `curl -sI` a la web, al nombre antiguo y a `raw.githubusercontent.com` → 404 en los tres.
+- `gh repo view --json visibility` → **PRIVATE**. El registro de la sesión confirma que el repositorio se creó con
+  `--public` y que `gh repo rename` / `gh repo edit --description --add-topic` no tocan la visibilidad: el cambio
+  se hizo fuera del agente. No se ha revertido (requiere permiso explícito del usuario).
+- Comprobado el PC del usuario: `oracle-db 2.0.0`, comando antiguo eliminado, `oracle26ai` en marcha
+  (127.0.0.1:1521), Docker Engine sin contenedores ni volúmenes.
+
+### Archivos modificados
+- `.ai_context/SESSION_HANDOFF.json` — rutas reales (`~/.config/oracle-db`, `~/.local/state/oracle-db`),
+  visibilidad y CI del último commit.
+- `.ai_context/PROJECT_STATUS.md` — visibilidad privada, CI verde, pendiente de decisión.
+- `.ai_context/CHANGELOG_AGENTS.md` — esta entrada.

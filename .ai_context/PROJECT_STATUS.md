@@ -31,10 +31,15 @@ en un asistente (zenity por defecto; whiptail con `--tui`; texto con `--texto`).
 | SQLcl / SQL Developer (opcionales) | ⚠️ | Solo simulación (URLs verificadas con HEAD) |
 
 ## Publicación
-- Repositorio: https://github.com/Piratapacorro/instalador-oracle-db-ubuntu (antes instalador-oracle23ai-ubuntu; GitHub redirige).
+- Repositorio: https://github.com/Piratapacorro/instalador-oracle-db-ubuntu (antes instalador-oracle23ai-ubuntu).
+- ⚠️ Visibilidad: **privado** (detectado el 2026-10-01 al verificar la publicación). Se creó público el 2026-09-24;
+  ningún comando del agente lo cambió. Mientras sea privado, la web, `git clone`, la descarga directa y la
+  redirección del nombre antiguo dan 404 a quien no tenga acceso. Decisión pendiente del usuario.
 - CI «Comprobaciones»: bash -n, ShellCheck (warning), prueba gráfica con zenity falso, ayuda, comprobar.
+  Verde en `b555eb6` (v2.0.0).
 
 ## Riesgos conocidos / pendientes
+- Decidir con el usuario si el repositorio vuelve a ser público (los compañeros no pueden verlo).
 - Probar Enterprise/Standard con una cuenta de Oracle real (y una red sin bloqueo).
 - Probar la imagen oficial de Oracle en una red sin bloqueo.
 - SQL Developer: confirmar que `SetJavaHome` en `sqldeveloper.conf` evita la pregunta del JDK.
