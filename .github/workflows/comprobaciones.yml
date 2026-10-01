@@ -14,18 +14,18 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Sintaxis de bash
-        run: bash -n oracle23ai.sh
+        run: bash -n oracle-db.sh
 
       - name: ShellCheck
-        run: shellcheck --severity=warning oracle23ai.sh tests/zenity-falso tests/prueba-gui.sh
+        run: shellcheck --severity=warning oracle-db.sh tests/zenity-falso tests/prueba-gui.sh
 
       - name: Interfaz gráfica simulada (zenity falso)
         run: tests/prueba-gui.sh
 
       - name: Ayuda y versión
         run: |
-          ./oracle23ai.sh --version
-          ./oracle23ai.sh ayuda
+          ./oracle-db.sh --version
+          ./oracle-db.sh ayuda
 
       - name: Diagnóstico (no cambia nada)
-        run: ./oracle23ai.sh comprobar
+        run: ./oracle-db.sh comprobar

@@ -51,3 +51,27 @@
 - La red bloqueó Oracle Cloud Storage → se usó `gvenzl/oracle-free:23` (26ai 23.26.3); base lista en 17 s.
 - Verificado: banner 26ai, FREEPDB1 READ WRITE, ALUMNO OPEN con DB_DEVELOPER_ROLE y perfil sin caducidad,
   puerto 127.0.0.1:1521, sin contraseñas en `docker inspect`, `.desktop` válido.
+
+## 2026-10-01 — v2.0.0: instalador genérico de Oracle Database (cualquier versión)
+
+### Cambios
+- `oracle23ai.sh` → `oracle-db.sh` (git mv); comando `oracle-db`; rutas `~/.config|state|share/oracle-db`;
+  acceso del menú «Oracle Database (Docker)» (`oracle-db.desktop`); repositorio renombrado a
+  `instalador-oracle-db-ubuntu`.
+- Catálogo `VERSION_LIST` + `IMAGE_CATALOG` (26ai, 23ai, 21c/18c/11g XE, 19c/21c EE/SE2) y `REPO_LIST`
+  para «Otra versión» (etiquetas en vivo con `list_tags`, Python/urllib).
+- `image_profile`: deduce de la imagen familia, servicios (FREEPDB1/XEPDB1/XE/ORCLPDB1), ruta de datos,
+  estilo de contraseña, DB_DEVELOPER_ROLE, cuenta necesaria, tiempo de creación y memoria mínima.
+- SQL por versión: sin PDB en 11g; permisos clásicos sin DB_DEVELOPER_ROLE; tablespace USERS si existe.
+- Enterprise/Standard: `docker login --password-stdin` con DOCKER_CONFIG temporal (credenciales borradas tras el pull).
+- Nombre de contenedor por versión (`oracle-26ai`, `oracle-21c-xe`…) y siguiente puerto libre si 1521 está ocupado.
+- `migrate_legacy` + `after_migration`: pasa instalaciones v1.x a los nombres nuevos.
+- Comando `versiones`; opción `--oracle` admite 26ai, 23ai, 21c, 18c, 11g, 19c, 21c-ee.
+
+### Pruebas
+- Simulación de las 7 versiones (modo texto) y de «Otra versión» con etiquetas reales de Docker Hub.
+- 40 comprobaciones del modo gráfico con zenity falso; recorrido whiptail por PTY (19 ventanas, OK).
+- Real con Docker Engine (HOME temporal, puertos 15211/15212): 11g XE y 21c XE → contraseñas, usuario,
+  permisos, CRUD, crear-usuario, password, desinstalar. Limpieza: 0 imágenes/contenedores/volúmenes.
+- Fallo encontrado en real y corregido: en 11g el usuario quedaba en el tablespace SYSTEM.
+- Migración real en el equipo del usuario: `oracle-db estado` gestiona su contenedor `oracle26ai`.

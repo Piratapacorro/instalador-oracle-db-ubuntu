@@ -1,7 +1,8 @@
 # Instalación manual paso a paso
 
-Esta guía hace **exactamente lo mismo que `oracle23ai.sh`**, pero a mano, comando a comando.
-Sirve para entender qué ocurre por debajo o para arreglar algo si la herramienta falla.
+Esta guía hace **exactamente lo mismo que `oracle-db.sh`**, pero a mano, comando a comando y para
+cualquier versión de Oracle Database. Sirve para entender qué ocurre por debajo o para arreglar algo
+si la herramienta falla.
 
 > Ejecuta los comandos como **tu usuario normal** (no como root). Los que empiezan por `sudo`
 > te pedirán tu contraseña de Ubuntu.
@@ -59,7 +60,7 @@ ls -l /dev/kvm
 sudo usermod -aG kvm "$USER"
 ```
 
-Si `ls -l /dev/kvm` muestra `crw-rw----+` normalmente ya tienes acceso. Si Docker Desktop
+Si `ls -l /dev/kvm` muestra `crw-rw----+`, normalmente ya tienes acceso. Si Docker Desktop
 se queja de KVM más adelante, **cierra sesión y vuelve a entrar** para que se aplique el grupo `kvm`.
 
 ---
@@ -131,7 +132,7 @@ systemctl --user start docker-desktop
 
 (O ábrelo desde el menú de aplicaciones: **Docker Desktop**.)
 
-La primera vez aparece el **Docker Subscription Service Agreement**: léelo y pulsa **Accept**
+Si aparece el **Docker Subscription Service Agreement**, léelo y pulsa **Accept**
 (es gratuito para uso personal y educativo). Puedes saltarte el inicio de sesión (*Skip*).
 
 Comprueba que responde:
@@ -149,91 +150,129 @@ systemctl --user enable docker-desktop
 
 ### Memoria para Docker
 
-Oracle necesita al menos **3 GB** (mejor 4 GB) dentro de Docker Desktop. Si `docker info`
-muestra menos, en Docker Desktop ve a **Settings → Resources → Advanced → Memory limit**,
-súbelo a 4 GB o más y pulsa **Apply & restart**.
+Oracle Free y XE necesitan al menos **3 GB** (mejor 4 GB) dentro de Docker Desktop; Enterprise/Standard,
+unos **4 GB** o más. Si `docker info` muestra menos, en Docker Desktop ve a
+**Settings → Resources → Advanced → Memory limit**, súbelo y pulsa **Apply & restart**.
 
 ---
 
-## 6. Descargar la imagen de Oracle Database Free
+## 6. Elegir la versión y descargar su imagen
 
-Elige **una**:
+| Versión | Imagen oficial | Imagen de Docker Hub | Servicio para trabajar | Ruta de datos en el contenedor |
+|---|---|---|---|---|
+| 26ai Free | `container-registry.oracle.com/database/free:latest` | `gvenzl/oracle-free:23` | `FREEPDB1` | `/opt/oracle/oradata` |
+| 23ai Free | `container-registry.oracle.com/database/free:23.9.0.0` | `gvenzl/oracle-free:23.9` | `FREEPDB1` | `/opt/oracle/oradata` |
+| 21c XE | `container-registry.oracle.com/database/express:21.3.0-xe` | `gvenzl/oracle-xe:21` | `XEPDB1` | `/opt/oracle/oradata` |
+| 18c XE | `container-registry.oracle.com/database/express:18.4.0-xe` | `gvenzl/oracle-xe:18` | `XEPDB1` | `/opt/oracle/oradata` |
+| 11g XE | — | `gvenzl/oracle-xe:11` | `XE` (no tiene PDB) | `/u01/app/oracle/oradata` |
+| 19c Enterprise/Standard | `container-registry.oracle.com/database/enterprise:19.3.0.0` | — | `ORCLPDB1` | `/opt/oracle/oradata` |
+| 21c Enterprise/Standard | `container-registry.oracle.com/database/enterprise:21.3.0.0` | — | `ORCLPDB1` | `/opt/oracle/oradata` |
+
+Todas las etiquetas disponibles (también actualizaciones concretas como 23.4 o 23.26.1):
+
+- Oficiales: <https://container-registry.oracle.com> (Database → free / express / enterprise).
+- Docker Hub: <https://hub.docker.com/r/gvenzl/oracle-free/tags> y <https://hub.docker.com/r/gvenzl/oracle-xe/tags>.
+
+Descarga la que elijas, por ejemplo:
 
 ```bash
-# Imagen oficial de Oracle · 23ai (23.9) · ~3,4 GB
-docker pull container-registry.oracle.com/database/free:23.9.0.0
-
-# Alternativa en Docker Hub (Gerald Venzl) · 23ai (23.9) · ~1 GB
-docker pull gvenzl/oracle-free:23.9
+docker pull container-registry.oracle.com/database/free:latest   # 26ai, imagen oficial
+docker pull gvenzl/oracle-xe:21                                   # 21c XE, Docker Hub
 ```
 
 > **¿La descarga oficial falla con `i/o timeout` o `objectstorage...oraclecloud.com`?**
 > Tu red bloquea el almacenamiento de Oracle Cloud (pasa en algunas redes de centros
-> educativos). Usa la imagen de Docker Hub.
+> educativos). Usa la imagen equivalente de Docker Hub.
 
-Etiquetas útiles:
+### Enterprise y Standard: iniciar sesión antes de descargar
 
-| Imagen | Versión |
-|---|---|
-| `container-registry.oracle.com/database/free:23.9.0.0` | 23ai 23.9, completa |
-| `container-registry.oracle.com/database/free:23.9.0.0-lite` | 23ai 23.9, reducida |
-| `container-registry.oracle.com/database/free:latest` | 26ai (23.26.x), la más reciente |
-| `gvenzl/oracle-free:23.9` · `23.9-full` | 23ai 23.9 (normal / completa) |
-| `gvenzl/oracle-free:23` | 26ai (23.26.x) |
+1. Crea una cuenta gratuita en oracle.com.
+2. En <https://container-registry.oracle.com> abre **Database → enterprise** y **acepta la licencia**.
+3. En tu perfil del registro genera un **Auth Token**.
+4. Inicia sesión (te pedirá el usuario y, como contraseña, el token), descarga y cierra la sesión:
+
+```bash
+docker login container-registry.oracle.com
+docker pull container-registry.oracle.com/database/enterprise:19.3.0.0
+docker logout container-registry.oracle.com
+```
 
 ---
 
 ## 7. Crear el volumen y el contenedor
 
+Cambia `oracle-26ai` por un nombre propio de tu versión (por ejemplo `oracle-21c-xe`) si vas a tener varias.
+
 ```bash
-docker volume create oracle23ai-datos
+docker volume create oracle-26ai-datos
 ```
 
-**Imagen oficial:**
+**Imagen oficial Free o XE:**
 
 ```bash
-docker run -d --name oracle23ai \
+docker run -d --name oracle-26ai \
   -p 127.0.0.1:1521:1521 \
-  -v oracle23ai-datos:/opt/oracle/oradata \
+  -v oracle-26ai-datos:/opt/oracle/oradata \
   -e ORACLE_CHARACTERSET=AL32UTF8 \
   --restart unless-stopped \
-  container-registry.oracle.com/database/free:23.9.0.0
+  container-registry.oracle.com/database/free:latest
 ```
 
-**Imagen de Docker Hub (gvenzl):**
+**Imagen de Docker Hub (gvenzl), Free o XE:**
 
 ```bash
-docker run -d --name oracle23ai \
+docker run -d --name oracle-21c-xe \
   -p 127.0.0.1:1521:1521 \
-  -v oracle23ai-datos:/opt/oracle/oradata \
+  -v oracle-21c-xe-datos:/opt/oracle/oradata \
   -e ORACLE_RANDOM_PASSWORD=yes \
   --restart unless-stopped \
-  gvenzl/oracle-free:23.9
+  gvenzl/oracle-xe:21
 ```
+
+Para **11g XE** cambia la ruta de datos y añade memoria compartida:
+`-v oracle-11g-xe-datos:/u01/app/oracle/oradata --shm-size=1g` con la imagen `gvenzl/oracle-xe:11`.
+
+**Enterprise / Standard Edition (19c o 21c):**
+
+```bash
+docker run -d --name oracle-19c-ee \
+  -p 127.0.0.1:1521:1521 \
+  -v oracle-19c-ee-datos:/opt/oracle/oradata \
+  -e ORACLE_SID=ORCLCDB -e ORACLE_PDB=ORCLPDB1 \
+  -e ORACLE_EDITION=enterprise \
+  -e ORACLE_CHARACTERSET=AL32UTF8 \
+  --restart unless-stopped \
+  container-registry.oracle.com/database/enterprise:19.3.0.0
+```
+
+(Para Standard Edition 2: `-e ORACLE_EDITION=standard`.)
 
 Notas:
 
 - `-p 127.0.0.1:1521:1521` solo permite conexiones desde tu equipo. Para aceptar conexiones
-  de tu red usa `-p 1521:1521`.
-- El volumen `oracle23ai-datos` guarda la base de datos: si borras el contenedor, los datos siguen ahí.
-- No pasamos la contraseña con `-e ORACLE_PWD=...` para que no quede visible en `docker inspect`:
-  la imagen genera una aleatoria temporal y en el paso 9 la cambiamos por la nuestra.
+  de tu red usa `-p 1521:1521`. Si ya tienes otra base de datos en el 1521, usa otro puerto
+  del equipo: `-p 127.0.0.1:1522:1521`.
+- El volumen guarda la base de datos: si borras el contenedor, los datos siguen ahí.
+- No pasamos la contraseña con `-e ORACLE_PWD=...` ni `-e ORACLE_PASSWORD=...` para que no quede
+  visible en `docker inspect`: la imagen genera una aleatoria temporal y en el paso 9 la cambiamos por la nuestra.
 
 ---
 
 ## 8. Esperar a que la base de datos esté lista
 
 ```bash
-docker logs -f oracle23ai
+docker logs -f oracle-26ai
 ```
 
-Espera a ver este mensaje (la primera vez tarda entre 2 y 15 minutos) y pulsa `Ctrl+C`:
+Espera a ver este mensaje y pulsa `Ctrl+C`:
 
 ```
 #########################
 DATABASE IS READY TO USE!
 #########################
 ```
+
+La primera vez tarda entre unos segundos y 15 minutos (Free y XE), o entre 15 y 45 minutos (Enterprise/Standard).
 
 ---
 
@@ -242,19 +281,20 @@ DATABASE IS READY TO USE!
 Entra como SYSDBA dentro del contenedor (no pide contraseña):
 
 ```bash
-docker exec -it oracle23ai sqlplus / as sysdba
+docker exec -it oracle-26ai sqlplus / as sysdba
 ```
 
-Y ejecuta (cambia `TuClave123` y `alumno` por los tuyos):
+Y ejecuta (cambia `TuClave123`, `alumno` y `Alumno123x` por los tuyos):
 
 ```sql
--- Administradores (SYS y SYSTEM son comunes a todo el CDB)
+-- Administradores (SYS y SYSTEM son comunes a toda la base de datos)
 ALTER USER SYS IDENTIFIED BY "TuClave123";
 ALTER USER SYSTEM IDENTIFIED BY "TuClave123" ACCOUNT UNLOCK;
 
--- Pasar a la base de datos de trabajo (PDB)
+-- Pasar a la base de trabajo (PDB): FREEPDB1, XEPDB1 u ORCLPDB1 según tu versión.
+-- En 11g XE no hay PDB: sáltate esta línea y la de PDBADMIN.
 ALTER SESSION SET CONTAINER = FREEPDB1;
-ALTER USER PDBADMIN IDENTIFIED BY "TuClave123" ACCOUNT UNLOCK;   -- solo en la imagen oficial
+ALTER USER PDBADMIN IDENTIFIED BY "TuClave123" ACCOUNT UNLOCK;   -- solo en imágenes oficiales con PDB
 
 -- Perfil sin caducidad de contraseña (para que no caduque a mitad de curso)
 CREATE PROFILE PERFIL_PRACTICAS LIMIT PASSWORD_LIFE_TIME UNLIMITED;
@@ -264,7 +304,17 @@ CREATE USER alumno IDENTIFIED BY "Alumno123x"
   DEFAULT TABLESPACE USERS QUOTA UNLIMITED ON USERS
   PROFILE PERFIL_PRACTICAS;
 GRANT CREATE SESSION TO alumno;
-GRANT DB_DEVELOPER_ROLE TO alumno;   -- rol de 23ai: tablas, vistas, procedimientos, etc.
+```
+
+Y los permisos, según la versión:
+
+```sql
+-- 26ai y 23ai: el rol para desarrolladores lo incluye todo
+GRANT DB_DEVELOPER_ROLE TO alumno;
+
+-- 21c, 19c, 18c y 11g (no existe DB_DEVELOPER_ROLE):
+GRANT CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE PROCEDURE, CREATE TRIGGER,
+      CREATE TYPE, CREATE SYNONYM, CREATE MATERIALIZED VIEW TO alumno;
 
 EXIT
 ```
@@ -279,28 +329,27 @@ EXIT
 | Dato | Valor |
 |---|---|
 | Host | `localhost` |
-| Puerto | `1521` |
-| Servicio (PDB, para trabajar) | `FREEPDB1` |
-| Servicio (CDB, administración) | `FREE` |
+| Puerto | `1521` (o el que pusiste en `-p`) |
+| Servicio | el de tu versión: `FREEPDB1`, `XEPDB1`, `XE` u `ORCLPDB1` |
 
 ```bash
 # SQL*Plus dentro del contenedor (te pide la contraseña)
-docker exec -it oracle23ai sqlplus alumno@//localhost:1521/FREEPDB1
+docker exec -it oracle-26ai sqlplus alumno@//localhost:1521/FREEPDB1
 ```
 
 - **JDBC:** `jdbc:oracle:thin:@//localhost:1521/FREEPDB1`
 - **SQL Developer:** Nueva conexión → Tipo *Básico* → Host `localhost` → Puerto `1521` →
-  **Nombre del servicio** `FREEPDB1` (no «SID»).
+  **Nombre del servicio** el de tu versión (no «SID»).
 
 ---
 
 ## 11. Uso diario
 
 ```bash
-docker start oracle23ai          # arrancar (Docker Desktop debe estar abierto)
-docker stop -t 120 oracle23ai    # parar de forma ordenada
-docker ps -a                     # ver el estado
-docker logs -f oracle23ai        # ver el registro
+docker start oracle-26ai          # arrancar (Docker Desktop debe estar abierto)
+docker stop -t 120 oracle-26ai    # parar de forma ordenada
+docker ps -a                      # ver el estado
+docker logs -f oracle-26ai        # ver el registro
 ```
 
 ---
@@ -312,8 +361,8 @@ docker logs -f oracle23ai        # ver el registro
 ```bash
 sudo apt-get install -y openjdk-17-jre-headless unzip
 curl -fLo /tmp/sqlcl.zip https://download.oracle.com/otn_software/java/sqldeveloper/sqlcl-latest.zip
-mkdir -p ~/.local/share/oracle23ai && unzip -q /tmp/sqlcl.zip -d ~/.local/share/oracle23ai
-~/.local/share/oracle23ai/sqlcl/bin/sql alumno@//localhost:1521/FREEPDB1
+mkdir -p ~/.local/share/oracle-db && unzip -q /tmp/sqlcl.zip -d ~/.local/share/oracle-db
+~/.local/share/oracle-db/sqlcl/bin/sql alumno@//localhost:1521/FREEPDB1
 ```
 
 ### SQL Developer 24.3.1 (gráfico)
@@ -322,8 +371,8 @@ mkdir -p ~/.local/share/oracle23ai && unzip -q /tmp/sqlcl.zip -d ~/.local/share/
 sudo apt-get install -y openjdk-17-jdk unzip
 curl -fLo /tmp/sqldeveloper.zip \
   https://download.oracle.com/otn_software/java/sqldeveloper/sqldeveloper-24.3.1.347.1826-no-jre.zip
-unzip -q /tmp/sqldeveloper.zip -d ~/.local/share/oracle23ai
-~/.local/share/oracle23ai/sqldeveloper/sqldeveloper.sh
+unzip -q /tmp/sqldeveloper.zip -d ~/.local/share/oracle-db
+~/.local/share/oracle-db/sqldeveloper/sqldeveloper.sh
 ```
 
 La primera vez pregunta la ruta del JDK: escribe `/usr/lib/jvm/java-17-openjdk-amd64`.

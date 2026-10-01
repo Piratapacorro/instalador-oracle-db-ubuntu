@@ -1,18 +1,16 @@
 {
-  "project": "instalador-oracle23ai-ubuntu",
+  "project": "instalador-oracle-db-ubuntu",
   "updated": "2026-10-01",
-  "entrypoint": "oracle23ai.sh",
+  "entrypoint": "oracle-db.sh",
   "language": "bash (UI y documentación en español)",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "defaults": {
-    "container": "oracle23ai",
-    "volume": "oracle23ai-datos",
-    "port": 1521,
+    "container": "oracle-<versión>",
+    "volume": "<contenedor>-datos",
+    "port": "1521 o el siguiente libre",
     "bind": "127.0.0.1",
-    "pdb": "FREEPDB1",
     "profile": "PERFIL_PRACTICAS",
-    "image_official": "container-registry.oracle.com/database/free:23.9.0.0",
-    "image_fallback": "docker.io/gvenzl/oracle-free:23.9"
+    "recommended_version": "26ai"
   },
   "design": {
     "secrets": "Nunca en disco/argv/env: la imagen arranca con contraseña aleatoria y se cambia con SQL por stdin (sqlplus / as sysdba).",
@@ -20,34 +18,36 @@
     "docker_cmd": "desktop -> docker --context desktop-linux; engine -> docker --context default (o sudo docker).",
     "config": "~/.config/oracle23ai/config (clave=valor, lista blanca, sin contraseñas)",
     "logs": "~/.local/state/oracle23ai/",
-    "network_block": "Si objectstorage.*.oraclecloud.com resuelve a IP privada o no conecta, se propone Docker Hub."
+    "network_block": "Si objectstorage.*.oraclecloud.com resuelve a IP privada o no conecta, se propone Docker Hub.",
+    "profiles": "image_profile(imagen, clave) fija CDB/PDB/servicio/ruta/rol/login/memoria; se llama al cargar la config y al elegir imagen.",
+    "enterprise_login": "docker login --password-stdin con DOCKER_CONFIG temporal; se borra tras el pull."
   },
   "tested_real": [
-    "docker-desktop install/start (4.93.0)",
-    "gui wizard + panel entry",
-    "26ai via gvenzl/oracle-free:23",
-    "docker-engine path",
-    "gvenzl 23.9",
-    "keep existing container",
+    "docker-desktop 4.93.0",
+    "26ai gvenzl (PC del usuario)",
+    "11g-xe gvenzl",
+    "21c-xe gvenzl",
+    "gui wizard + panel",
+    "migración v1→v2",
     "password",
     "crear-usuario",
-    "parar/iniciar",
     "desinstalar"
   ],
   "tested_simulated_only": [
-    "official Oracle image pull (blocked network)",
+    "imagen oficial de Oracle (red bloqueada)",
+    "19c/21c Enterprise/Standard (cuenta de Oracle)",
+    "18c-xe",
     "sqlcl",
     "sqldeveloper"
   ],
   "next_steps": [
-    "Probar imagen oficial en red sin bloqueo",
-    "Probar SQLcl y SQL Developer reales"
+    "Probar Enterprise/Standard con cuenta de Oracle",
+    "Probar imagen oficial en red sin bloqueo"
   ],
-  "repository": "https://github.com/Piratapacorro/instalador-oracle23ai-ubuntu",
+  "repository": "https://github.com/Piratapacorro/instalador-oracle-db-ubuntu",
   "ci": {
     "workflow": ".github/workflows/comprobaciones.yml",
-    "status": "success",
-    "last_green_commit": "a1a1aa4"
+    "status": "success"
   },
   "ui_modes": {
     "gui": "zenity 4 (por defecto con escritorio)",
@@ -59,6 +59,18 @@
     "container": "oracle26ai",
     "image": "gvenzl/oracle-free:23",
     "pdb_user": "ALUMNO",
-    "port": "127.0.0.1:1521"
-  }
+    "port": "127.0.0.1:1521",
+    "command": "~/.local/bin/oracle-db"
+  },
+  "versions": [
+    "26ai",
+    "23ai",
+    "21c-xe",
+    "18c-xe",
+    "11g-xe",
+    "19c-ee",
+    "21c-ee",
+    "otra (cualquier etiqueta)"
+  ],
+  "legacy": "v1.x se llamaba oracle23ai (comando, rutas y .desktop); migrate_legacy lo pasa a oracle-db"
 }
