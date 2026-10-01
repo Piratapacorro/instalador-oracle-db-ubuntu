@@ -33,3 +33,21 @@
 - `gh repo create instalador-oracle23ai-ubuntu --public --source . --push` (commit 40481a0).
 - CI detectó 6 avisos de ShellCheck (SC2194, SC2155, SC2174, SC2178/SC2128, SC2034) → corregidos en a1a1aa4; CI en verde.
 - Eliminadas funciones sin uso (`in_group_now`, `desktop_capable`).
+
+## 2026-10-01 — Interfaz gráfica (v1.1.0) e instalación real de 26ai
+
+### Cambios
+- Capa de interfaz con tres modos: `gui` (zenity, por defecto con escritorio), `tui` (whiptail), `texto`.
+- Asistente gráfico (`wizard_gui`): opciones en una lista y contraseñas en un formulario.
+- Ventana de progreso alimentada por un FIFO (pasos, partes descargadas, espera de Oracle).
+- `sudo -A` con SUDO_ASKPASS (zenity) en modo gráfico; todos los `sudo` pasan por `"${SUDO[@]}"`.
+- Panel gráfico de uso diario + acceso `~/.local/share/applications/oracle23ai.desktop` con icono SVG propio.
+- Opción `--oracle 23ai|26ai`.
+- `tests/zenity-falso` + `tests/prueba-gui.sh` (24 comprobaciones) añadidos a la CI; `df` falso en la prueba
+  porque el runner de GitHub tenía 13 GB libres (el instalador exige 15).
+
+### Prueba real en el equipo del usuario (con su intervención: asistente, sudo y acuerdo de Docker)
+- Docker Desktop 4.93.0 instalado desde cero (SHA-256 verificado), VM con 5,6 GB.
+- La red bloqueó Oracle Cloud Storage → se usó `gvenzl/oracle-free:23` (26ai 23.26.3); base lista en 17 s.
+- Verificado: banner 26ai, FREEPDB1 READ WRITE, ALUMNO OPEN con DB_DEVELOPER_ROLE y perfil sin caducidad,
+  puerto 127.0.0.1:1521, sin contraseñas en `docker inspect`, `.desktop` válido.

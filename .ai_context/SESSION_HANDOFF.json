@@ -1,9 +1,9 @@
 {
   "project": "instalador-oracle23ai-ubuntu",
-  "updated": "2026-09-24",
+  "updated": "2026-10-01",
   "entrypoint": "oracle23ai.sh",
   "language": "bash (UI y documentación en español)",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "defaults": {
     "container": "oracle23ai",
     "volume": "oracle23ai-datos",
@@ -23,6 +23,9 @@
     "network_block": "Si objectstorage.*.oraclecloud.com resuelve a IP privada o no conecta, se propone Docker Hub."
   },
   "tested_real": [
+    "docker-desktop install/start (4.93.0)",
+    "gui wizard + panel entry",
+    "26ai via gvenzl/oracle-free:23",
     "docker-engine path",
     "gvenzl 23.9",
     "keep existing container",
@@ -32,19 +35,30 @@
     "desinstalar"
   ],
   "tested_simulated_only": [
-    "docker-desktop install/start",
-    "official Oracle image pull",
+    "official Oracle image pull (blocked network)",
     "sqlcl",
     "sqldeveloper"
   ],
   "next_steps": [
-    "Probar en Ubuntu 24.04 limpio con Docker Desktop real",
-    "Probar imagen oficial en red sin bloqueo"
+    "Probar imagen oficial en red sin bloqueo",
+    "Probar SQLcl y SQL Developer reales"
   ],
   "repository": "https://github.com/Piratapacorro/instalador-oracle23ai-ubuntu",
   "ci": {
     "workflow": ".github/workflows/comprobaciones.yml",
     "status": "success",
     "last_green_commit": "a1a1aa4"
+  },
+  "ui_modes": {
+    "gui": "zenity 4 (por defecto con escritorio)",
+    "tui": "whiptail (--tui)",
+    "texto": "--texto / --sin-tui"
+  },
+  "installed_on_user_pc": {
+    "engine": "docker-desktop",
+    "container": "oracle26ai",
+    "image": "gvenzl/oracle-free:23",
+    "pdb_user": "ALUMNO",
+    "port": "127.0.0.1:1521"
   }
 }
